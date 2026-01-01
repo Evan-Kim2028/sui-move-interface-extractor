@@ -80,7 +80,13 @@ def _doctor_real_agent(cfg_env: dict[str, str]) -> None:
         console.print(f"[red]GET {base}/models failed:[/red] {e!r}")
 
     # Probe one minimal chat completion.
-    payload = {"model": cfg.model, "messages": [{"role": "user", "content": "Return [] as JSON."}]}
+    payload = {"model": cfg.model, "messages": [{"role": "user", "content": "Return {\"key_types\": []} as JSON."}]}
+    if cfg.thinking:
+        payload["thinking"] = {"type": cfg.thinking}
+        if cfg.clear_thinking is not None:
+            payload["thinking"]["clear_thinking"] = cfg.clear_thinking
+    if cfg.response_format:
+        payload["response_format"] = {"type": cfg.response_format}
     try:
         r = httpx.post(
             f"{base}/chat/completions",
@@ -150,8 +156,9 @@ def _build_agent_prompt(interface_json: dict, *, max_structs: int) -> str:
     }
 
     instructions = (
-        "Given the Sui Move package structure below, return a JSON array of type strings "
-        'in the form "0xADDR::module::Struct" for structs that you believe have the Move ability `key`.\n'
+        "Given the Sui Move package structure below, return a JSON object with a single key "
+        '"key_types" that maps to a JSON array of type strings in the form "0xADDR::module::Struct". '
+        "Include only structs that you believe have the Move ability `key`.\n"
         "Output ONLY valid JSON.\n"
     )
     return instructions + json.dumps(payload, indent=2, sort_keys=True)
@@ -286,8 +293,25 @@ def run(
         interface_json = _run_rust_emit_bytecode_json(Path(pkg.package_dir), rust_bin)
         truth = _extract_key_types_from_interface_json(interface_json)
         if real_agent is not None:
-            prompt = _build_agent_prompt(interface_json, max_structs=max_structs_in_prompt)
-            predicted = real_agent.complete_type_list(prompt)
+            cur_max_structs = max_structs_in_prompt
+            last_err: Exception | None = None
+            for _attempt in range(4):
+                prompt = _build_agent_prompt(interface_json, max_structs=cur_max_structs)
+                try:
+                    predicted = real_agent.complete_type_list(prompt)
+                    break
+                except ValueError as e:
+                    last_err = e
+                    msg = str(e)
+                    if "empty content" in msg or "hit max_tokens" in msg:
+                        next_max = max(5, cur_max_structs // 2)
+                        if next_max == cur_max_structs:
+                            raise
+                        cur_max_structs = next_max
+                        continue
+                    raise
+            else:
+                raise RuntimeError(f"real-agent failed after prompt shrink retries: {last_err}")
         else:
             predicted = agent.predict_key_types(truth_key_types=truth)
         score = score_key_types(truth, predicted)

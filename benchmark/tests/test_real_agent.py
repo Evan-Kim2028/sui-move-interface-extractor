@@ -58,10 +58,48 @@ def test_real_agent_openai_compatible_parses_json_array() -> None:
         temperature=0.0,
         max_tokens=16,
         thinking=None,
+        response_format=None,
+        clear_thinking=None,
     )
     agent = RealAgent(cfg, client=client)
     out = agent.complete_type_list("return []")
     assert out == {"0x1::m::S", "0x2::n::T"}
+
+
+def test_real_agent_sends_response_format_json_object() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = request.read().decode("utf-8")
+        assert '"response_format"' in body
+        assert '"json_object"' in body
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"key_types": ["0x1::m::S"]}',
+                        }
+                    }
+                ]
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.Client(transport=transport)
+    cfg = RealAgentConfig(
+        provider="openai_compatible",
+        api_key="test",
+        base_url="https://api.z.ai/api/coding/paas/v4",
+        model="glm-4.7",
+        temperature=0.0,
+        max_tokens=16,
+        thinking="enabled",
+        response_format="json_object",
+        clear_thinking=True,
+    )
+    agent = RealAgent(cfg, client=client)
+    out = agent.complete_type_list("return {\"key_types\": []}")
+    assert out == {"0x1::m::S"}
 
 
 def test_real_agent_retries_on_429() -> None:
@@ -94,6 +132,8 @@ def test_real_agent_retries_on_429() -> None:
         temperature=0.0,
         max_tokens=16,
         thinking=None,
+        response_format=None,
+        clear_thinking=None,
     )
     agent = RealAgent(cfg, client=client)
     out = agent.complete_type_list("return []")

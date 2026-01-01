@@ -28,10 +28,13 @@ cp .env.example .env
 # SMI_API_BASE_URL=https://api.z.ai/api/coding/paas/v4
 # (If you’re on Model API instead, use https://api.z.ai/api/paas/v4)
 # SMI_MODEL=glm-4.7
-# SMI_THINKING=disabled
+# SMI_THINKING=enabled
+# SMI_CLEAR_THINKING=true
+# SMI_RESPONSE_FORMAT=json_object
+# SMI_MAX_TOKENS=2048
 ```
 
-Smoke test (does a single tiny API call and expects `[]` JSON):
+Smoke test (does a single tiny API call and expects `{ "key_types": [] }` JSON):
 
 ```bash
 uv run smi-bench --corpus-root <sui-packages-checkout>/packages/mainnet_most_used --smoke-agent --agent real-openai-compatible

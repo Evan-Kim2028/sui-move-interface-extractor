@@ -18,6 +18,8 @@ class RealAgentConfig:
     temperature: float
     max_tokens: int
     thinking: str | None
+    response_format: str | None
+    clear_thinking: bool | None
 
 
 def _env_get(*keys: str) -> str | None:
@@ -26,6 +28,15 @@ def _env_get(*keys: str) -> str | None:
         if v:
             return v
     return None
+
+
+def _parse_bool(v: str) -> bool:
+    s = v.strip().lower()
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off"):
+        return False
+    raise ValueError(f"invalid bool: {v!r}")
 
 
 def load_real_agent_config(env_overrides: dict[str, str] | None = None) -> RealAgentConfig:
@@ -58,6 +69,8 @@ def load_real_agent_config(env_overrides: dict[str, str] | None = None) -> RealA
     temperature_s = get("SMI_TEMPERATURE") or "0"
     max_tokens_s = get("SMI_MAX_TOKENS") or "800"
     thinking_s = get("SMI_THINKING")
+    response_format_s = get("SMI_RESPONSE_FORMAT")
+    clear_thinking_s = get("SMI_CLEAR_THINKING")
 
     try:
         temperature = float(temperature_s)
@@ -67,6 +80,10 @@ def load_real_agent_config(env_overrides: dict[str, str] | None = None) -> RealA
         max_tokens = int(max_tokens_s)
     except Exception as e:
         raise ValueError(f"invalid SMI_MAX_TOKENS={max_tokens_s}") from e
+    try:
+        clear_thinking = _parse_bool(clear_thinking_s) if clear_thinking_s else None
+    except Exception as e:
+        raise ValueError(f"invalid SMI_CLEAR_THINKING={clear_thinking_s!r}") from e
 
     return RealAgentConfig(
         provider=provider,
@@ -76,6 +93,8 @@ def load_real_agent_config(env_overrides: dict[str, str] | None = None) -> RealA
         temperature=temperature,
         max_tokens=max_tokens,
         thinking=thinking_s,
+        response_format=response_format_s,
+        clear_thinking=clear_thinking,
     )
 
 
@@ -99,7 +118,8 @@ class RealAgent:
         Minimal connectivity + parsing check. Returns a set (likely empty).
         """
         prompt = (
-            "Return a JSON array of strings. For smoke testing, return an empty array: []"
+            'Return a JSON object with a single field "key_types" which is a JSON array of strings. '
+            'For smoke testing, return: {"key_types": []}'
         )
         return self.complete_type_list(prompt)
 
@@ -120,6 +140,12 @@ class RealAgent:
         }
         if self.cfg.thinking:
             payload["thinking"] = {"type": self.cfg.thinking}
+            if self.cfg.clear_thinking is not None:
+                payload["thinking"]["clear_thinking"] = self.cfg.clear_thinking
+        if self.cfg.response_format:
+            if self.cfg.response_format != "json_object":
+                raise ValueError(f"unsupported SMI_RESPONSE_FORMAT={self.cfg.response_format!r}")
+            payload["response_format"] = {"type": "json_object"}
 
         backoff_s = 1.0
         last_exc: Exception | None = None
@@ -215,5 +241,16 @@ class RealAgent:
 
         if not isinstance(content, str):
             raise ValueError("unexpected response content type")
+
+        if content.strip() == "":
+            finish_reason = None
+            try:
+                finish_reason = data["choices"][0].get("finish_reason")
+            except Exception:
+                pass
+            hint = ""
+            if finish_reason == "length":
+                hint = " (model hit max_tokens; increase SMI_MAX_TOKENS or reduce prompt size)"
+            raise ValueError(f"model returned empty content{hint}")
 
         return extract_type_list(content)
