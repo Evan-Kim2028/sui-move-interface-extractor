@@ -63,4 +63,3 @@ def extract_type_list(text: str) -> set[str]:
         if isinstance(key_types, list):
             return {x for x in key_types if isinstance(x, str)}
     raise JsonExtractError("unexpected JSON shape (expected array or {key_types:[...]})")
-

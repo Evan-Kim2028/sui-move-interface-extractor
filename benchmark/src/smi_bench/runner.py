@@ -15,8 +15,9 @@ from rich.progress import track
 from smi_bench.agents.mock_agent import MockAgent
 from smi_bench.agents.real_agent import RealAgent, load_real_agent_config
 from smi_bench.dataset import collect_packages, sample_packages
-from smi_bench.judge import KeyTypeScore, score_key_types
 from smi_bench.env import load_dotenv
+from smi_bench.judge import KeyTypeScore, score_key_types
+from smi_bench.logging import JsonlLogger, default_run_id
 
 console = Console()
 
@@ -80,7 +81,7 @@ def _doctor_real_agent(cfg_env: dict[str, str]) -> None:
         console.print(f"[red]GET {base}/models failed:[/red] {e!r}")
 
     # Probe one minimal chat completion.
-    payload = {"model": cfg.model, "messages": [{"role": "user", "content": "Return {\"key_types\": []} as JSON."}]}
+    payload = {"model": cfg.model, "messages": [{"role": "user", "content": 'Return {"key_types": []} as JSON.'}]}
     if cfg.thinking:
         payload["thinking"] = {"type": cfg.thinking}
         if cfg.clear_thinking is not None:
@@ -211,6 +212,27 @@ def _git_head_for_path(path: Path) -> dict | None:
     return {"head": head}
 
 
+def _load_ids_file_ordered(path: Path) -> list[str]:
+    """
+    Load a newline-delimited package id list.
+
+    - Preserves file order
+    - Ignores blank lines and '#' comments
+    - Dedups while preserving first occurrence
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in path.read_text().splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
 @dataclass
 class PackageResult:
     package_id: str
@@ -244,6 +266,8 @@ def _load_checkpoint(out_path: Path) -> RunResult:
         finished = int(data["finished_at_unix_seconds"])
         corpus_root_name = str(data["corpus_root_name"])
         corpus_git = data.get("corpus_git")
+        target_ids_file = data.get("target_ids_file")
+        target_ids_total = data.get("target_ids_total")
         samples = int(data["samples"])
         seed = int(data["seed"])
         agent = str(data["agent"])
@@ -261,6 +285,8 @@ def _load_checkpoint(out_path: Path) -> RunResult:
         finished_at_unix_seconds=finished,
         corpus_root_name=corpus_root_name,
         corpus_git=corpus_git if isinstance(corpus_git, dict) else None,
+        target_ids_file=target_ids_file if isinstance(target_ids_file, str) else None,
+        target_ids_total=int(target_ids_total) if isinstance(target_ids_total, int) else None,
         samples=samples,
         seed=seed,
         agent=agent,
@@ -316,6 +342,8 @@ class RunResult:
     finished_at_unix_seconds: int
     corpus_root_name: str
     corpus_git: dict | None
+    target_ids_file: str | None
+    target_ids_total: int | None
     samples: int
     seed: int
     agent: str
@@ -328,6 +356,7 @@ def run(
     corpus_root: Path,
     samples: int,
     seed: int,
+    package_ids_file: Path | None,
     agent_name: str,
     rust_bin: Path,
     build_rust: bool,
@@ -342,17 +371,22 @@ def run(
     resume: bool,
     per_package_timeout_seconds: float,
     include_type_lists: bool,
+    log_dir: Path | None,
+    run_id: str | None,
 ) -> RunResult:
     if build_rust:
         console.print("[bold]building rust…[/bold]")
         _build_rust()
 
     if not rust_bin.exists():
-        raise SystemExit(
-            f"rust binary not found: {rust_bin} (run `cargo build --release --locked`)"
-        )
+        raise SystemExit(f"rust binary not found: {rust_bin} (run `cargo build --release --locked`)")
 
     env_overrides = load_dotenv(env_file) if env_file is not None else {}
+
+    logger: JsonlLogger | None = None
+    if log_dir is not None:
+        rid = run_id or default_run_id(prefix="phase1")
+        logger = JsonlLogger(base_dir=log_dir, run_id=rid)
 
     if doctor_agent:
         _doctor_real_agent(env_overrides)
@@ -366,9 +400,31 @@ def run(
         raise SystemExit(0)
 
     started = int(time.time())
+    if logger is not None:
+        logger.write_run_metadata(
+            {
+                "schema_version": 1,
+                "benchmark": "phase1_key_struct_discovery",
+                "started_at_unix_seconds": started,
+                "agent": agent_name,
+                "seed": seed,
+                "corpus_root": str(corpus_root),
+                "argv": list(map(str, os.sys.argv)),
+            }
+        )
+        logger.event("run_started", started_at_unix_seconds=started, agent=agent_name, seed=seed)
 
     packages = collect_packages(corpus_root)
-    picked = sample_packages(packages, samples, seed)
+    target_ids_file_s: str | None = None
+    target_ids_total: int | None = None
+    if package_ids_file is not None:
+        ids = _load_ids_file_ordered(package_ids_file)
+        by_id = {p.package_id: p for p in packages}
+        picked = [by_id[i] for i in ids if i in by_id]
+        target_ids_file_s = package_ids_file.name
+        target_ids_total = len(picked)
+    else:
+        picked = sample_packages(packages, samples, seed)
 
     if not picked:
         raise SystemExit(f"no packages found under: {corpus_root}")
@@ -382,11 +438,17 @@ def run(
             cp = _load_checkpoint(out_path)
             if cp.agent != agent_name or cp.seed != seed:
                 raise SystemExit(
-                    f"checkpoint mismatch: out has agent={cp.agent} seed={cp.seed}, expected agent={agent_name} seed={seed}"
+                    "checkpoint mismatch: out has agent="
+                    f"{cp.agent} seed={cp.seed}, expected agent={agent_name} seed={seed}"
                 )
             results, seen, error_count, started = _resume_results_from_checkpoint(cp)
             picked = [p for p in picked if p.package_id not in seen]
             console.print(f"[yellow]resuming:[/yellow] already_done={len(seen)} remaining={len(picked)}")
+
+    if package_ids_file is not None:
+        # Treat --samples as a batch size over the manifest order (works with --resume).
+        if samples > 0 and samples < len(picked):
+            picked = picked[:samples]
 
     if agent_name.startswith("mock-"):
         agent = MockAgent(behavior=agent_name.replace("mock-", ""), seed=seed)
@@ -402,6 +464,8 @@ def run(
     for pkg_i, pkg in enumerate(track(picked, description="benchmark"), start=done_already + 1):
         pkg_started = time.monotonic()
         deadline = pkg_started + per_package_timeout_seconds
+        if logger is not None:
+            logger.event("package_started", package_id=pkg.package_id, i=pkg_i)
         interface_json = _run_rust_emit_bytecode_json(Path(pkg.package_dir), rust_bin)
         truth = _extract_key_types_from_interface_json(interface_json)
         predicted: set[str] = set()
@@ -473,6 +537,28 @@ def run(
                 predicted_key_types_list=predicted_list,
             )
         )
+        if logger is not None:
+            logger.package_row(
+                {
+                    "package_id": pkg.package_id,
+                    "truth_key_types": len(truth),
+                    "predicted_key_types": len(predicted),
+                    "score": asdict(score),
+                    "error": err,
+                    "elapsed_seconds": elapsed_s,
+                    "attempts": attempts,
+                    "max_structs_used": max_structs_used,
+                    "timed_out": timed_out,
+                }
+            )
+            logger.event(
+                "package_finished",
+                package_id=pkg.package_id,
+                i=pkg_i,
+                elapsed_seconds=elapsed_s,
+                error=err,
+                timed_out=timed_out,
+            )
 
         if out_path is not None and checkpoint_every > 0 and (pkg_i % checkpoint_every) == 0:
             finished = int(time.time())
@@ -485,6 +571,8 @@ def run(
                 finished_at_unix_seconds=finished,
                 corpus_root_name=corpus_root.name,
                 corpus_git=_git_head_for_path(corpus_root),
+                target_ids_file=target_ids_file_s,
+                target_ids_total=target_ids_total,
                 samples=len(results),
                 seed=seed,
                 agent=agent_name,
@@ -525,6 +613,8 @@ def run(
         finished_at_unix_seconds=finished,
         corpus_root_name=corpus_root.name,
         corpus_git=_git_head_for_path(corpus_root),
+        target_ids_file=target_ids_file_s,
+        target_ids_total=target_ids_total,
         samples=len(results),
         seed=seed,
         agent=agent_name,
@@ -556,6 +646,15 @@ def run(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         _write_checkpoint(out_path, run_result)
 
+    if logger is not None:
+        logger.event(
+            "run_finished",
+            finished_at_unix_seconds=finished,
+            samples=len(results),
+            errors=error_count,
+            avg_f1=avg_f1,
+        )
+
     return run_result
 
 
@@ -564,6 +663,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--corpus-root", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=25)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--package-ids-file",
+        type=Path,
+        help="Optional file of package ids to run in order (1 per line; '#' comments allowed).",
+    )
     parser.add_argument(
         "--agent",
         type=str,
@@ -629,6 +733,14 @@ def main(argv: list[str] | None = None) -> None:
         default=10,
         help="Write partial results to --out every N packages (0 disables).",
     )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=Path("logs"),
+        help="Directory to write JSONL logs under (default: benchmark/logs). Use --no-log to disable.",
+    )
+    parser.add_argument("--run-id", type=str, help="Optional run id for log directory naming.")
+    parser.add_argument("--no-log", action="store_true", help="Disable JSONL logging.")
     args = parser.parse_args(argv)
 
     env_file = args.env_file if args.env_file.exists() else None
@@ -642,6 +754,7 @@ def main(argv: list[str] | None = None) -> None:
         corpus_root=args.corpus_root,
         samples=args.samples,
         seed=args.seed,
+        package_ids_file=args.package_ids_file,
         agent_name=args.agent,
         rust_bin=args.rust_bin,
         build_rust=args.build_rust,
@@ -656,6 +769,8 @@ def main(argv: list[str] | None = None) -> None:
         resume=args.resume,
         per_package_timeout_seconds=args.per_package_timeout_seconds,
         include_type_lists=args.include_type_lists,
+        log_dir=None if args.no_log else args.log_dir,
+        run_id=args.run_id,
     )
 
 

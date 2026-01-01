@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -19,6 +20,25 @@ def normalize_address(addr: str) -> str:
     return "0x" + h.rjust(64, "0")
 
 
+_ADDR_RE = re.compile(r"0x[0-9a-fA-F]{1,64}")
+
+
+def normalize_type_string(type_str: str) -> str:
+    """
+    Canonicalize all `0x...` address literals inside a Sui type string by padding to 32 bytes.
+
+    Examples:
+      - "0x2::coin::Coin<0x2::sui::SUI>" -> "0x000...0002::coin::Coin<0x000...0002::sui::SUI>"
+      - "0xdf..::m::S" -> "0x0df..::m::S"
+    """
+    s = type_str.strip()
+
+    def _sub(m: re.Match[str]) -> str:
+        return normalize_address(m.group(0))
+
+    return _ADDR_RE.sub(_sub, s)
+
+
 def canonical_base_type(type_str: str) -> str:
     """
     Normalize a Sui type string to its canonical base type (no type args, canonical address).
@@ -27,7 +47,7 @@ def canonical_base_type(type_str: str) -> str:
       - "0x2::coin::Coin<0x2::sui::SUI>" -> "0x000...0002::coin::Coin"
       - "0x2::object::UID" -> "0x000...0002::object::UID"
     """
-    s = type_str.strip()
+    s = normalize_type_string(type_str)
     i = s.find("<")
     base = s[:i] if i != -1 else s
     parts = base.split("::")
@@ -45,6 +65,24 @@ def extract_created_object_types(dev_inspect: dict) -> set[str]:
     may not include types in effects, in which case this returns an empty set.
     """
     out: set[str] = set()
+
+    # Wrapper produced by our Rust helper: { devInspect: { ... }, staticCreatedObjectTypes: [...] }
+    inner = dev_inspect.get("devInspect")
+    if isinstance(inner, dict):
+        dev_inspect = inner
+
+    # Dry-run responses include objectChanges at the top-level.
+    obj_changes = dev_inspect.get("objectChanges")
+    if isinstance(obj_changes, list):
+        for ch in obj_changes:
+            if not isinstance(ch, dict):
+                continue
+            if ch.get("type") != "created":
+                continue
+            ot = ch.get("objectType")
+            if isinstance(ot, str) and ot:
+                out.add(ot)
+        return out
 
     # Some RPC responses nest as { effects: { objectChanges: [...] } }
     effects = dev_inspect.get("effects")
@@ -78,8 +116,10 @@ def score_inhabitation(*, target_key_types: set[str], created_object_types: set[
 
     Matching is done on base types (ignoring type arguments).
     """
-    target_base = {canonical_base_type(t) for t in target_key_types}
-    created_base = {canonical_base_type(t) for t in created_object_types}
+    target_norm = {normalize_type_string(t) for t in target_key_types}
+    created_norm = {normalize_type_string(t) for t in created_object_types}
+    target_base = {canonical_base_type(t) for t in target_norm}
+    created_base = {canonical_base_type(t) for t in created_norm}
 
     hits = target_base & created_base
     missing = target_base - hits

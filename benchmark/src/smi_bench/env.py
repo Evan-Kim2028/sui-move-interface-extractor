@@ -30,4 +30,3 @@ def load_dotenv(path: Path) -> dict[str, str]:
             v = v[1:-1]
         out[k] = v
     return out
-
