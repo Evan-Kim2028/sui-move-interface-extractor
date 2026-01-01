@@ -305,7 +305,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--rust-bin", type=Path, default=_default_rust_binary())
     parser.add_argument("--build-rust", action="store_true")
     parser.add_argument("--out", type=Path)
-    parser.add_argument("--env-file", type=Path, default=Path("benchmark/.env"))
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=Path(".env"),
+        help="Path to a dotenv file (default: .env in the current working directory).",
+    )
     parser.add_argument("--max-structs-in-prompt", type=int, default=200)
     parser.add_argument(
         "--smoke-agent",
@@ -313,6 +318,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Run a minimal real-agent call and exit (requires env vars).",
     )
     args = parser.parse_args(argv)
+
+    env_file = args.env_file if args.env_file.exists() else None
+    if env_file is None:
+        # Convenience: if user runs from repo root, allow benchmark/.env without extra flags.
+        fallback = Path("benchmark/.env")
+        if fallback.exists():
+            env_file = fallback
 
     run(
         corpus_root=args.corpus_root,
@@ -322,7 +334,7 @@ def main(argv: list[str] | None = None) -> None:
         rust_bin=args.rust_bin,
         build_rust=args.build_rust,
         out_path=args.out,
-        env_file=args.env_file if args.env_file.exists() else None,
+        env_file=env_file,
         max_structs_in_prompt=args.max_structs_in_prompt,
         smoke_agent=args.smoke_agent,
     )

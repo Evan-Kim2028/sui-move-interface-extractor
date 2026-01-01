@@ -19,6 +19,15 @@ Copy `benchmark/.env.example` to `benchmark/.env` and fill in:
 - `SMI_MODEL`
 - `SMI_API_BASE_URL` (OpenAI-compatible base; for non-OpenAI providers)
 
+Z.AI GLM-4.7 example:
+
+```bash
+cp .env.example .env
+# set:
+# SMI_API_BASE_URL=https://api.z.ai/v1
+# SMI_MODEL=glm-4.7
+```
+
 Smoke test (does a single tiny API call and expects `[]` JSON):
 
 ```bash
