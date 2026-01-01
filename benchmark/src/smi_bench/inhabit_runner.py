@@ -9,6 +9,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import httpx
 from rich.console import Console
 from rich.progress import track
 
@@ -22,6 +23,98 @@ from smi_bench.logging import JsonlLogger, default_run_id
 from smi_bench.runner import _extract_key_types_from_interface_json
 
 console = Console()
+
+
+def _fetch_inventory(rpc_url: str, sender: str) -> dict[str, list[str]]:
+    """
+    Fetch owned objects for sender and group by type.
+    Returns: { "TypeStr": ["0xID1", "0xID2"] }
+    """
+    if sender == "0x0" or not sender.startswith("0x"):
+        return {}
+
+    try:
+        # Simple paginated fetch of all owned objects
+        objects = []
+        cursor = None
+        while True:
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "suix_getOwnedObjects",
+                "params": [sender, {"filter": None, "options": {"showType": True}}, cursor, 50],
+            }
+            # Using synchronous httpx.post? We imported httpx.
+            # But httpx is usually async or used via client.
+            # We can use `httpx.post` (sync).
+            # But wait, `inhabit_runner.py` uses `subprocess` mostly.
+            # `httpx` is imported.
+            resp = httpx.post(rpc_url, json=payload, timeout=30)
+            if resp.status_code != 200:
+                break
+            res = resp.json()
+            if "error" in res:
+                break
+            data = res.get("result", {})
+            for item in data.get("data", []):
+                objects.append(item)
+            if not data.get("hasNextPage"):
+                break
+            cursor = data.get("nextCursor")
+            # Limit inventory fetch to avoid huge wallets slowing down benchmark
+            if len(objects) > 200:
+                break
+
+        inventory = {}
+        for obj in objects:
+            t = obj.get("data", {}).get("type")
+            oid = obj.get("data", {}).get("objectId")
+            if t and oid:
+                t_norm = normalize_type_string(t)
+                if t_norm not in inventory:
+                    inventory[t_norm] = []
+                inventory[t_norm].append(oid)
+        return inventory
+    except Exception:
+        # Fail gracefully on inventory fetch (network issues)
+        return {}
+
+
+def _resolve_placeholders(ptb_spec: dict, inventory: dict[str, list[str]]) -> bool:
+    """
+    Replace {"$smi_placeholder": "Type"} args with {"imm_or_owned_object": "ID"} from inventory.
+    Returns True if all placeholders were resolved, False otherwise.
+    """
+    resolved_all = True
+
+    for call in ptb_spec.get("calls", []):
+        if not isinstance(call, dict):
+            continue
+        args = call.get("args", [])
+        for i, arg in enumerate(args):
+            if not isinstance(arg, dict):
+                continue
+
+            ph = arg.get("$smi_placeholder")
+            if ph:
+                # Resolve it
+                ph_norm = normalize_type_string(ph)
+                candidates = inventory.get(ph_norm)
+                if candidates:
+                    # Pick the first one (deterministic)
+                    args[i] = {"imm_or_owned_object": candidates[0]}
+                else:
+                    # Check for &mut T -> T (inventory usually has T)
+                    # If we have T in inventory, we can pass it as mutable ref if owned.
+                    # But normalized string handles this? No, normalize keeps struct.
+                    # If placeholder is `0x...::Mod::T`, inventory key is same.
+                    # What if placeholder is `&0x...`? `construct_arg` peels refs!
+                    # So placeholder should be struct type.
+
+                    # Cannot resolve
+                    resolved_all = False
+
+    return resolved_all
 
 
 def _parse_gas_budget_ladder(s: str) -> list[int]:
@@ -683,6 +776,10 @@ def run(
         gas_budget_used: int | None = None
         plan_variant: str | None = None
 
+        inventory = {}
+        if agent_name == "baseline-search" and sender and sender != "0x0":
+            inventory = _fetch_inventory(rpc_url, sender)
+
         try:
             ladder = _parse_gas_budget_ladder(gas_budget_ladder)
             budgets = _gas_budgets_to_try(base=gas_budget, ladder=ladder)
@@ -697,10 +794,10 @@ def run(
 
                 if not candidates:
                     # No candidates -> one empty plan attempt to record failure/stats
-                    plan_iterator = [{"calls": []}]
+                    plans_to_try = [{"calls": []}]
                 else:
                     for c in candidates:
-                        plan_iterator.append({"calls": c})
+                        plans_to_try.append({"calls": c})
             elif agent_name == "mock-empty":
                 plans_to_try = [{"calls": []}]
             elif agent_name == "mock-planfile":
@@ -719,14 +816,19 @@ def run(
 
             for plan_i, plan_item in enumerate(plans_to_try):
                 plan_attempts = plan_i + 1
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining <= 0:
+                    raise TimeoutError(f"per-package timeout exceeded ({per_package_timeout_seconds}s)")
 
                 if isinstance(plan_item, dict):
-                    ptb_spec_base = plan_item
+                    ptb_spec_base = copy.deepcopy(plan_item)
+                    if "$smi_placeholder" in json.dumps(ptb_spec_base):
+                        # Try to resolve placeholders
+                        if not _resolve_placeholders(ptb_spec_base, inventory):
+                            # Skip this candidate if we can't resolve deps
+                            continue
                 else:
                     assert real_agent is not None
-                    remaining = max(0.0, deadline - time.monotonic())
-                    if remaining <= 0:
-                        raise TimeoutError(f"per-package timeout exceeded ({per_package_timeout_seconds}s)")
                     if last_failure_ctx is None or plan_i == 0:
                         prompt = _build_real_agent_prompt(package_id=pkg.package_id, target_key_types=truth_key_types)
                     else:
@@ -912,7 +1014,9 @@ def run(
                     # For baseline, we might want to continue to find *better* variants?
                     # But baseline-search iterates *plans* (candidates). Inner variants are heuristics.
                     # If a variant succeeds for a candidate, that candidate is "done".
-                    if simulation_mode != "dry-run" or (best_score and best_score.created_hits > 0):
+                    if simulation_mode != "dry-run" or (
+                        best_score and best_score.created_hits == best_score.targets and best_score.targets > 0
+                    ):
                         # heuristic: if we got hits, maybe stop variants for this plan?
                         # Actually original logic was: stop variants if dry_run_ok.
                         pass

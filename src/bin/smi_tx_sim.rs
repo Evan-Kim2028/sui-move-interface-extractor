@@ -15,7 +15,7 @@ use std::str::FromStr;
 use sui_json_rpc_types::SuiObjectDataOptions;
 use sui_json_rpc_types::{Coin, DryRunTransactionBlockResponse, ObjectChange};
 use sui_sdk::SuiClientBuilder;
-use sui_types::base_types::{ObjectID, ObjectRef, ObjectDigest, SequenceNumber, SuiAddress};
+use sui_types::base_types::{ObjectDigest, ObjectID, ObjectRef, SequenceNumber, SuiAddress};
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
 use sui_types::transaction::{
     Argument, CallArg, Command, ObjectArg, ProgrammableMoveCall, SharedObjectMutability,
@@ -299,7 +299,10 @@ fn mock_object_ref(id: ObjectID) -> ObjectRef {
     (id, SequenceNumber::from_u64(1), ObjectDigest::new([0; 32]))
 }
 
-async fn resolve_object_ref(client: &Option<sui_sdk::SuiClient>, id: ObjectID) -> Result<ObjectRef> {
+async fn resolve_object_ref(
+    client: &Option<sui_sdk::SuiClient>,
+    id: ObjectID,
+) -> Result<ObjectRef> {
     if let Some(client) = client {
         let resp = client
             .read_api()
@@ -333,8 +336,8 @@ fn load_sender_sui_coin(
         // Use a deterministic ID based on index to differentiate
         let mut bytes = [0u8; 32];
         bytes[31] = index as u8; // simple hack
-        // or just use 0x2::sui::SUI ID if it was an object? No, coins have random IDs.
-        // Let's use 0x...01, 0x...02
+                                 // or just use 0x2::sui::SUI ID if it was an object? No, coins have random IDs.
+                                 // Let's use 0x...01, 0x...02
         let id = ObjectID::from_bytes(bytes).unwrap();
         return Ok(mock_object_ref(id));
     }
@@ -363,19 +366,27 @@ async fn resolve_argument(
     let obj = v
         .as_object()
         .ok_or_else(|| anyhow!("PTB arg must be an object (got {v:?})"))?;
-    
+
     if let Some(res) = obj.get("result") {
-        let i = res.as_u64().ok_or_else(|| anyhow!("result index must be u16"))?;
+        let i = res
+            .as_u64()
+            .ok_or_else(|| anyhow!("result index must be u16"))?;
         return Ok(Argument::Result(i as u16));
     }
-    
+
     if let Some(nested) = obj.get("nested_result") {
-        let arr = nested.as_array().ok_or_else(|| anyhow!("nested_result must be [cmd, res]"))?;
+        let arr = nested
+            .as_array()
+            .ok_or_else(|| anyhow!("nested_result must be [cmd, res]"))?;
         if arr.len() != 2 {
             bail!("nested_result must be [u16, u16]");
         }
-        let cmd = arr[0].as_u64().ok_or_else(|| anyhow!("nested_result cmd index must be u16"))?;
-        let res = arr[1].as_u64().ok_or_else(|| anyhow!("nested_result res index must be u16"))?;
+        let cmd = arr[0]
+            .as_u64()
+            .ok_or_else(|| anyhow!("nested_result cmd index must be u16"))?;
+        let res = arr[1]
+            .as_u64()
+            .ok_or_else(|| anyhow!("nested_result res index must be u16"))?;
         return Ok(Argument::NestedResult(cmd as u16, res as u16));
     }
 
@@ -386,7 +397,7 @@ async fn resolve_argument(
 async fn resolve_call_arg_as_input(
     ptb: &mut ProgrammableTransactionBuilder,
     ctx: Option<&ResolveCtx<'_>>,
-    v: &Value
+    v: &Value,
 ) -> Result<Argument> {
     let obj = v
         .as_object()
@@ -444,9 +455,7 @@ async fn resolve_call_arg_as_input(
                 .as_str()
                 .ok_or_else(|| anyhow!("vector_u8_utf8 must be a string"))?;
             let bytes = s.as_bytes().to_vec();
-            CallArg::Pure(
-                bcs::to_bytes(&bytes).context("bcs vector<u8>")?,
-            )
+            CallArg::Pure(bcs::to_bytes(&bytes).context("bcs vector<u8>")?)
         }
         "vector_u8_hex" => {
             let s = vv
@@ -461,9 +470,7 @@ async fn resolve_call_arg_as_input(
                 .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
                 .collect::<std::result::Result<Vec<u8>, _>>()
                 .context("parse hex bytes")?;
-            CallArg::Pure(
-                bcs::to_bytes(&bytes).context("bcs vector<u8>")?,
-            )
+            CallArg::Pure(bcs::to_bytes(&bytes).context("bcs vector<u8>")?)
         }
         "vector_address" => {
             let arr = vv
@@ -477,9 +484,7 @@ async fn resolve_call_arg_as_input(
                 let s = normalize_sui_address(s)?;
                 out.push(SuiAddress::from_str(&s).with_context(|| format!("parse address: {s}"))?);
             }
-            CallArg::Pure(
-                bcs::to_bytes(&out).context("bcs vector<address>")?,
-            )
+            CallArg::Pure(bcs::to_bytes(&out).context("bcs vector<address>")?)
         }
         "vector_bool" => {
             let arr = vv
@@ -492,9 +497,7 @@ async fn resolve_call_arg_as_input(
                         .ok_or_else(|| anyhow!("vector_bool elements must be true/false"))?,
                 );
             }
-            CallArg::Pure(
-                bcs::to_bytes(&out).context("bcs vector<bool>")?,
-            )
+            CallArg::Pure(bcs::to_bytes(&out).context("bcs vector<bool>")?)
         }
         "vector_u16" => {
             let arr = vv
@@ -507,9 +510,7 @@ async fn resolve_call_arg_as_input(
                     .ok_or_else(|| anyhow!("vector_u16 elements must be integers"))?;
                 out.push(n.try_into().context("vector_u16 element out of range")?);
             }
-            CallArg::Pure(
-                bcs::to_bytes(&out).context("bcs vector<u16>")?,
-            )
+            CallArg::Pure(bcs::to_bytes(&out).context("bcs vector<u16>")?)
         }
         "vector_u32" => {
             let arr = vv
@@ -522,9 +523,7 @@ async fn resolve_call_arg_as_input(
                     .ok_or_else(|| anyhow!("vector_u32 elements must be integers"))?;
                 out.push(n.try_into().context("vector_u32 element out of range")?);
             }
-            CallArg::Pure(
-                bcs::to_bytes(&out).context("bcs vector<u32>")?,
-            )
+            CallArg::Pure(bcs::to_bytes(&out).context("bcs vector<u32>")?)
         }
         "vector_u64" => {
             let arr = vv
@@ -537,9 +536,7 @@ async fn resolve_call_arg_as_input(
                         .ok_or_else(|| anyhow!("vector_u64 elements must be integers"))?,
                 );
             }
-            CallArg::Pure(
-                bcs::to_bytes(&out).context("bcs vector<u64>")?,
-            )
+            CallArg::Pure(bcs::to_bytes(&out).context("bcs vector<u64>")?)
         }
         "gas_coin" => {
             let Some(ctx) = ctx else {
@@ -637,7 +634,7 @@ async fn resolve_call_arg_as_input(
         }
         other => bail!("unsupported PTB arg kind: {other}"),
     };
-    Ok(ptb.input(call_arg).context("ptb.input")?)
+    ptb.input(call_arg).context("ptb.input")
 }
 
 async fn pick_gas_coin(
@@ -725,9 +722,9 @@ async fn main() -> Result<()> {
         } else if let Some(id_s) = args.gas_coin.as_deref() {
             Some(resolve_object_ref(&client, parse_object_id(id_s)?).await?)
         } else if matches!(args.mode, Mode::BuildOnly) {
-             // For build-only, we might need a dummy gas coin ID for context?
-             // Or just pick one via mock logic.
-             Some(pick_gas_coin(&client, sender, args.gas_coin.as_deref()).await?)
+            // For build-only, we might need a dummy gas coin ID for context?
+            // Or just pick one via mock logic.
+            Some(pick_gas_coin(&client, sender, args.gas_coin.as_deref()).await?)
         } else {
             None
         };
