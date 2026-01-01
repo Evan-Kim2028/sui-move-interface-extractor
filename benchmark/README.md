@@ -24,8 +24,11 @@ Z.AI GLM-4.7 example:
 ```bash
 cp .env.example .env
 # set:
-# SMI_API_BASE_URL=https://api.z.ai/api/paas/v4
+# If you’re on the GLM Coding Plan, use:
+# SMI_API_BASE_URL=https://api.z.ai/api/coding/paas/v4
+# (If you’re on Model API instead, use https://api.z.ai/api/paas/v4)
 # SMI_MODEL=glm-4.7
+# SMI_THINKING=disabled
 ```
 
 Smoke test (does a single tiny API call and expects `[]` JSON):

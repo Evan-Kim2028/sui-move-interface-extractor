@@ -17,6 +17,7 @@ class RealAgentConfig:
     model: str
     temperature: float
     max_tokens: int
+    thinking: str | None
 
 
 def _env_get(*keys: str) -> str | None:
@@ -56,6 +57,7 @@ def load_real_agent_config(env_overrides: dict[str, str] | None = None) -> RealA
 
     temperature_s = get("SMI_TEMPERATURE") or "0"
     max_tokens_s = get("SMI_MAX_TOKENS") or "800"
+    thinking_s = get("SMI_THINKING")
 
     try:
         temperature = float(temperature_s)
@@ -73,6 +75,7 @@ def load_real_agent_config(env_overrides: dict[str, str] | None = None) -> RealA
         model=model,
         temperature=temperature,
         max_tokens=max_tokens,
+        thinking=thinking_s,
     )
 
 
@@ -115,6 +118,8 @@ class RealAgent:
                 {"role": "user", "content": prompt},
             ],
         }
+        if self.cfg.thinking:
+            payload["thinking"] = {"type": self.cfg.thinking}
 
         backoff_s = 1.0
         last_exc: Exception | None = None
@@ -168,7 +173,10 @@ class RealAgent:
                             or "no resource package" in api_err
                             or api_err.startswith("1113:")
                         ):
-                            raise RuntimeError(f"provider quota/billing error: {api_err}")
+                            hint = ""
+                            if "api.z.ai/api/paas/v4" in self.cfg.base_url:
+                                hint = " (if you are on the Z.AI GLM Coding Plan, try base_url=https://api.z.ai/api/coding/paas/v4)"
+                            raise RuntimeError(f"provider quota/billing error: {api_err}{hint}")
 
                     retry_after = r.headers.get("retry-after")
                     if retry_after:

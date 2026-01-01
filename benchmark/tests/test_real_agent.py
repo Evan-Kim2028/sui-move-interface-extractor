@@ -57,6 +57,7 @@ def test_real_agent_openai_compatible_parses_json_array() -> None:
         model="glm-4.7",
         temperature=0.0,
         max_tokens=16,
+        thinking=None,
     )
     agent = RealAgent(cfg, client=client)
     out = agent.complete_type_list("return []")
@@ -92,6 +93,7 @@ def test_real_agent_retries_on_429() -> None:
         model="glm-4.7",
         temperature=0.0,
         max_tokens=16,
+        thinking=None,
     )
     agent = RealAgent(cfg, client=client)
     out = agent.complete_type_list("return []")

@@ -19,6 +19,7 @@
 .envrc
 /benchmark/.env
 /benchmark/.env.*
+!/benchmark/.env.example
 .eggs/
 *.egg-info/
 .pytest_cache/
