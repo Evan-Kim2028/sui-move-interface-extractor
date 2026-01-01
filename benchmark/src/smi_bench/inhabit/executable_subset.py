@@ -62,6 +62,54 @@ class PackageAnalysis:
     reasons_summary: dict[str, int]
 
 
+def build_constructor_index(modules: dict) -> dict[str, list[str]]:
+    """
+    Build an index of public functions that return a specific struct type.
+    Map: "0xADDR::mod::Struct" -> ["0xADDR::mod::func", ...]
+    """
+    index: dict[str, list[str]] = {}
+    
+    for module_name, mod in modules.items():
+        if not isinstance(mod, dict):
+            continue
+        funs = mod.get("functions")
+        if not isinstance(funs, dict):
+            continue
+        
+        # We also need the package address to construct full types
+        # Usually modules in interface_json don't store self-address explicitly in 'modules' keys,
+        # but the struct types inside do. 
+        # Or we use the package_id from the outer scope?
+        # Actually, `mod` usually has "address" field in bytecode json.
+        mod_addr = mod.get("address", DEFAULT_ADDRESS)
+
+        for fun_name, f in funs.items():
+            if not isinstance(f, dict):
+                continue
+            if f.get("visibility") != "public":
+                continue
+            
+            returns = f.get("returns")
+            if not isinstance(returns, list) or len(returns) != 1:
+                continue
+            
+            ret_type = returns[0]
+            if not isinstance(ret_type, dict) or ret_type.get("kind") != "datatype":
+                continue
+            
+            type_str = json_type_to_string(ret_type)
+            # Only index if it's a struct defined in THIS package (heuristic)
+            # or broadly any struct.
+            # Let's index any struct return.
+            
+            target = f"{mod_addr}::{module_name}::{fun_name}"
+            if type_str not in index:
+                index[type_str] = []
+            index[type_str].append(target)
+            
+    return index
+
+
 def _is_tx_context_ref_param(t: dict) -> bool:
     """
     True if `t` is `&TxContext` or `&mut TxContext`.
@@ -158,11 +206,20 @@ def json_type_to_string(t: dict) -> str:
     return "unknown"
 
 
-def construct_arg(t: dict, next_result_idx: int) -> tuple[list[dict], dict] | None:
+def construct_arg(
+    t: dict, 
+    next_result_idx: int, 
+    constructor_index: dict[str, list[str]] | None = None,
+    modules_map: dict | None = None,
+    recursion_depth: int = 0
+) -> tuple[list[dict], dict] | None:
     """
     Generate valid PTB args for a type, potentially using setup calls.
     Returns (setup_calls, arg_value) or None if unsupported.
     """
+    if recursion_depth > 3:
+        return None
+
     # Try pure/object args first (legacy logic)
     pure = type_to_default_ptb_arg(t)
     if pure is not None:
@@ -173,19 +230,18 @@ def construct_arg(t: dict, next_result_idx: int) -> tuple[list[dict], dict] | No
     
     if kind == "ref":
         # If we can construct the inner type, we can pass it (VM allows borrow of result).
-        # We recursively construct the inner type.
         inner = t.get("to")
         if isinstance(inner, dict):
-            return construct_arg(inner, next_result_idx)
+            return construct_arg(inner, next_result_idx, constructor_index, modules_map, recursion_depth)
     
     if kind == "datatype":
         addr = t.get("address")
         mod = t.get("module")
         name = t.get("name")
+        type_str = json_type_to_string(t)
         
         # 0x1::string::String
         if addr == DEFAULT_ADDRESS and mod == STD_STRING_MODULE and name == "String":
-            # call 0x1::string::utf8(b"sui") -> Result
             return [
                 {
                     "target": "0x0000000000000000000000000000000000000000000000000000000000000001::string::utf8",
@@ -196,7 +252,6 @@ def construct_arg(t: dict, next_result_idx: int) -> tuple[list[dict], dict] | No
 
         # 0x1::ascii::String
         if addr == DEFAULT_ADDRESS and mod == STD_ASCII_MODULE and name == "String":
-            # call 0x1::ascii::string(b"sui") -> Result
             return [
                 {
                     "target": "0x0000000000000000000000000000000000000000000000000000000000000001::ascii::string",
@@ -207,7 +262,6 @@ def construct_arg(t: dict, next_result_idx: int) -> tuple[list[dict], dict] | No
 
         # 0x2::url::Url
         if addr == SUI_FRAMEWORK_ADDRESS and mod == SUI_URL_MODULE and name == "Url":
-            # call 0x2::url::new_unsafe_from_bytes(b"https://sui.io") -> Result
             return [
                 {
                     "target": "0x0000000000000000000000000000000000000000000000000000000000000002::url::new_unsafe_from_bytes",
@@ -218,21 +272,10 @@ def construct_arg(t: dict, next_result_idx: int) -> tuple[list[dict], dict] | No
 
         # 0x1::option::Option<T>
         if addr == DEFAULT_ADDRESS and mod == STD_OPTION_MODULE and name == "Option":
-            # call 0x1::option::none<T>() -> Result
             type_args = t.get("type_args", [])
             if not isinstance(type_args, list) or len(type_args) != 1:
                 return None
             inner_type_str = json_type_to_string(type_args[0])
-            # If inner type is a type param we don't know, it will be "unknown".
-            # But analyze_function fills generics with SUI, so it should be concrete here.
-            # However, t comes from the interface JSON, which has T0, T1.
-            # We need to substitute T0 with our heuristic fill (SUI) if it's a generic.
-            # NOTE: analyze_function does NOT replace params in the 't' dict.
-            # It just sets 'ptb_type_args' for the call.
-            # So 't' here might contain 'kind': 'type_param'.
-            # We need to handle that.
-            
-            # For now, let's assume if it's concrete, we use it. If it's type_param, we assume 0x2::sui::SUI.
             if type_args[0].get("kind") == "type_param":
                  inner_type_str = f"{SUI_FRAMEWORK_ADDRESS}::{SUI_MODULE}::{SUI_STRUCT}"
 
@@ -244,9 +287,92 @@ def construct_arg(t: dict, next_result_idx: int) -> tuple[list[dict], dict] | No
                 }
             ], {"result": next_result_idx}
 
+        # Constructor Discovery
+        if constructor_index and modules_map:
+            # Look up potential constructors
+            constructors = constructor_index.get(type_str, [])
+            for c_target in constructors:
+                # Parse target to find module/function def
+                # Expected: 0xADDR::mod::func
+                parts = c_target.split("::")
+                if len(parts) != 3:
+                    continue
+                # module name is parts[1], function is parts[2]
+                c_mod_name = parts[1]
+                c_fun_name = parts[2]
+                
+                c_mod = modules_map.get(c_mod_name)
+                if not c_mod: continue
+                c_f = c_mod.get("functions", {}).get(c_fun_name)
+                if not c_f: continue
+                
+                # Recursively analyze this constructor
+                # We need to pass recursion_depth + 1
+                # And we need to accumulate setup calls
+                
+                # Check constraints: no type params (or fillable), supported args
+                # We can reuse analyze_function? 
+                # analyze_function returns FunctionAnalysis.
+                # But analyze_function currently builds `ptb_calls` for *that* function.
+                # We need to chain it.
+                
+                # We can call analyze_function recursively?
+                # But analyze_function calls construct_arg.
+                # We need to pass the context.
+                
+                # Refactor: construct_arg needs to call analyze_function logic for the constructor.
+                # But avoiding circular import or complex dependency.
+                # I'll implement simple checks here.
+                
+                if c_f.get("type_params"):
+                    # Skip generic constructors for now (unless we fill them?)
+                    # Let's skip to keep it simple.
+                    continue
+                
+                c_params = c_f.get("params", [])
+                c_params = strip_implicit_tx_context_params(c_params)
+                
+                c_setup_calls = []
+                c_final_args = []
+                c_ok = True
+                
+                # Current offset for result index in the constructor chain
+                # We start with next_result_idx. 
+                # The constructor's setup calls will consume indices starting at next_result_idx.
+                # The constructor *itself* will be at index (next_result_idx + len(c_setup_calls)).
+                # BUT wait, the recursive calls will return setup_calls.
+                
+                current_idx = next_result_idx
+                
+                for p in c_params:
+                    # RECURSE
+                    res = construct_arg(p, current_idx, constructor_index, modules_map, recursion_depth + 1)
+                    if res is None:
+                        c_ok = False
+                        break
+                    
+                    sub_setup, sub_arg = res
+                    c_setup_calls.extend(sub_setup)
+                    c_final_args.append(sub_arg)
+                    current_idx += len(sub_setup)
+                
+                if c_ok:
+                    # Found a valid constructor!
+                    # Add the constructor call itself
+                    constructor_call = {
+                        "target": c_target,
+                        "type_args": [], # assumed empty
+                        "args": c_final_args
+                    }
+                    c_setup_calls.append(constructor_call)
+                    
+                    # The result of this constructor is the last call in c_setup_calls.
+                    # Index = next_result_idx + len(c_setup_calls) - 1
+                    res_idx = next_result_idx + len(c_setup_calls) - 1
+                    
+                    return c_setup_calls, {"result": res_idx}
+
         # Fallback: Emit a placeholder for any other struct.
-        # This allows the runner (if inventory-aware) to fill it later.
-        type_str = json_type_to_string(t)
         return [], {"$smi_placeholder": type_str}
 
     return None
@@ -327,7 +453,11 @@ def type_to_default_ptb_arg(t: dict) -> dict | None:
     return None
 
 
-def analyze_function(f: dict) -> FunctionAnalysis:
+def analyze_function(
+    f: dict, 
+    constructor_index: dict[str, list[str]] | None = None,
+    modules_map: dict | None = None
+) -> FunctionAnalysis:
     reasons = []
     
     if f.get("visibility") != "public" or f.get("is_entry") is not True:
@@ -347,11 +477,8 @@ def analyze_function(f: dict) -> FunctionAnalysis:
     if isinstance(params, list):
         params = strip_implicit_tx_context_params([p for p in params if isinstance(p, dict)])
         for p in params:
-            # We need to handle type params in 'p' if they exist.
-            # See logic in construct_arg for Option<T>.
-            # For now, construct_arg handles simple substitution for Option.
-            
-            res = construct_arg(p, len(ptb_calls))
+            # We pass index/map context here
+            res = construct_arg(p, len(ptb_calls), constructor_index, modules_map, 0)
             if res is None:
                 reasons.append(ExclusionReason.UNSUPPORTED_PARAM_TYPE)
                 break
@@ -389,6 +516,9 @@ def analyze_package(interface_json: dict) -> PackageAnalysis:
     candidates_ok = []
     candidates_rejected = []
     reasons_summary = {}
+    
+    # Build index
+    constructor_index = build_constructor_index(modules)
 
     for module_name in sorted(modules.keys()):
         mod = modules.get(module_name)
@@ -403,7 +533,8 @@ def analyze_package(interface_json: dict) -> PackageAnalysis:
                 continue
 
             target = f"{pkg_id}::{module_name}::{fun_name}"
-            analysis = analyze_function(f)
+            # Pass context
+            analysis = analyze_function(f, constructor_index, modules)
             
             if analysis.is_runnable:
                 # Construct the full call sequence
