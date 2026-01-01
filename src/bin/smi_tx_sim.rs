@@ -15,7 +15,7 @@ use std::str::FromStr;
 use sui_json_rpc_types::SuiObjectDataOptions;
 use sui_json_rpc_types::{Coin, DryRunTransactionBlockResponse, ObjectChange};
 use sui_sdk::SuiClientBuilder;
-use sui_types::base_types::{ObjectID, ObjectRef, SuiAddress};
+use sui_types::base_types::{ObjectID, ObjectRef, ObjectDigest, SequenceNumber, SuiAddress};
 use sui_types::programmable_transaction_builder::ProgrammableTransactionBuilder;
 use sui_types::transaction::{
     Argument, CallArg, Command, ObjectArg, ProgrammableMoveCall, SharedObjectMutability,
@@ -295,20 +295,29 @@ fn load_bytecode_modules(bytecode_package_dir: &Path) -> Result<HashMap<String, 
     Ok(out)
 }
 
-async fn resolve_object_ref(client: &sui_sdk::SuiClient, id: ObjectID) -> Result<ObjectRef> {
-    let resp = client
-        .read_api()
-        .get_object_with_options(id, SuiObjectDataOptions::new().with_owner())
-        .await
-        .with_context(|| format!("get_object {id}"))?;
-    let Some(data) = resp.data else {
-        bail!("object not found: {id}");
-    };
-    Ok(data.object_ref())
+fn mock_object_ref(id: ObjectID) -> ObjectRef {
+    (id, SequenceNumber::from_u64(1), ObjectDigest::new([0; 32]))
+}
+
+async fn resolve_object_ref(client: &Option<sui_sdk::SuiClient>, id: ObjectID) -> Result<ObjectRef> {
+    if let Some(client) = client {
+        let resp = client
+            .read_api()
+            .get_object_with_options(id, SuiObjectDataOptions::new().with_owner())
+            .await
+            .with_context(|| format!("get_object {id}"))?;
+        let Some(data) = resp.data else {
+            bail!("object not found: {id}");
+        };
+        Ok(data.object_ref())
+    } else {
+        // BuildOnly mode: return mock ref
+        Ok(mock_object_ref(id))
+    }
 }
 
 struct ResolveCtx<'a> {
-    client: &'a sui_sdk::SuiClient,
+    client: &'a Option<sui_sdk::SuiClient>,
     sender: SuiAddress,
     gas_coin_id: Option<ObjectID>,
     sender_sui_coins: Vec<ObjectRef>,
@@ -319,6 +328,17 @@ fn load_sender_sui_coin(
     index: usize,
     exclude_gas: bool,
 ) -> Result<ObjectRef> {
+    if ctx.client.is_none() {
+        // BuildOnly mode: return mock coin
+        // Use a deterministic ID based on index to differentiate
+        let mut bytes = [0u8; 32];
+        bytes[31] = index as u8; // simple hack
+        // or just use 0x2::sui::SUI ID if it was an object? No, coins have random IDs.
+        // Let's use 0x...01, 0x...02
+        let id = ObjectID::from_bytes(bytes).unwrap();
+        return Ok(mock_object_ref(id));
+    }
+
     let mut coins: Vec<ObjectRef> = ctx.sender_sui_coins.clone();
     if exclude_gas {
         if let Some(gas_id) = ctx.gas_coin_id {
@@ -523,9 +543,17 @@ async fn resolve_call_arg_as_input(
         }
         "gas_coin" => {
             let Some(ctx) = ctx else {
-                bail!("gas_coin requires RPC context (not available in build-only mode)");
+                // Should not happen if gas_coin is passed, but just in case
+                bail!("gas_coin missing context");
             };
             let Some(gas_id) = ctx.gas_coin_id else {
+                // If gas_coin was requested but not provided/resolved?
+                // In BuildOnly, gas_coin is None unless provided explicitly.
+                // If provided explicitly, we resolve it.
+                // If client is None, we return mock.
+                // So we need resolve_object_ref to handle client=None.
+                // And we need gas_id.
+                // If gas_id is None, we can't fetch it.
                 bail!("gas_coin requires a resolved gas coin id");
             };
             let oref = resolve_object_ref(ctx.client, gas_id).await?;
@@ -533,7 +561,7 @@ async fn resolve_call_arg_as_input(
         }
         "sender_sui_coin" => {
             let Some(ctx) = ctx else {
-                bail!("sender_sui_coin requires RPC context (not available in build-only mode)");
+                bail!("sender_sui_coin context missing");
             };
             let o = vv
                 .as_object()
@@ -548,7 +576,7 @@ async fn resolve_call_arg_as_input(
         }
         "imm_or_owned_object" => {
             let Some(ctx) = ctx else {
-                bail!("imm_or_owned_object requires RPC (not available in build-only mode)");
+                bail!("imm_or_owned_object context missing");
             };
             let s = vv
                 .as_str()
@@ -559,7 +587,7 @@ async fn resolve_call_arg_as_input(
         }
         "shared_object" => {
             let Some(ctx) = ctx else {
-                bail!("shared_object requires RPC (not available in build-only mode)");
+                bail!("shared_object context missing");
             };
             let o = vv
                 .as_object()
@@ -574,23 +602,27 @@ async fn resolve_call_arg_as_input(
                 .ok_or_else(|| anyhow!("shared_object.mutable must be true/false"))?;
             let id = parse_object_id(id_s)?;
 
-            let resp = ctx
-                .client
-                .read_api()
-                .get_object_with_options(id, SuiObjectDataOptions::new().with_owner())
-                .await
-                .with_context(|| format!("get_object {id}"))?;
-            let Some(data) = resp.data else {
-                bail!("object not found: {id}");
-            };
-            let owner = data
-                .owner
-                .ok_or_else(|| anyhow!("object missing owner: {id}"))?;
-            let initial_shared_version = match owner {
-                sui_types::object::Owner::Shared {
-                    initial_shared_version,
-                } => initial_shared_version,
-                _ => bail!("object is not shared: {id}"),
+            let initial_shared_version = if let Some(client) = ctx.client {
+                let resp = client
+                    .read_api()
+                    .get_object_with_options(id, SuiObjectDataOptions::new().with_owner())
+                    .await
+                    .with_context(|| format!("get_object {id}"))?;
+                let Some(data) = resp.data else {
+                    bail!("object not found: {id}");
+                };
+                let owner = data
+                    .owner
+                    .ok_or_else(|| anyhow!("object missing owner: {id}"))?;
+                match owner {
+                    sui_types::object::Owner::Shared {
+                        initial_shared_version,
+                    } => initial_shared_version,
+                    _ => bail!("object is not shared: {id}"),
+                }
+            } else {
+                // BuildOnly mode: mock shared version
+                SequenceNumber::from_u64(1)
             };
 
             CallArg::Object(ObjectArg::SharedObject {
@@ -609,16 +641,22 @@ async fn resolve_call_arg_as_input(
 }
 
 async fn pick_gas_coin(
-    client: &sui_sdk::SuiClient,
+    client: &Option<sui_sdk::SuiClient>,
     sender: SuiAddress,
     gas_coin: Option<&str>,
 ) -> Result<ObjectRef> {
+    let Some(rpc) = client else {
+        // BuildOnly: mock gas coin
+        let id = ObjectID::from_hex_literal("0x1234").unwrap();
+        return Ok(mock_object_ref(id));
+    };
+
     if let Some(id_s) = gas_coin {
         let id = parse_object_id(id_s)?;
         return resolve_object_ref(client, id).await;
     }
 
-    let page = client
+    let page = rpc
         .coin_read_api()
         .get_coins(sender, None, None, Some(1))
         .await
@@ -631,9 +669,12 @@ async fn pick_gas_coin(
 }
 
 async fn load_sender_sui_coins(
-    client: &sui_sdk::SuiClient,
+    client: &Option<sui_sdk::SuiClient>,
     sender: SuiAddress,
 ) -> Result<Vec<ObjectRef>> {
+    let Some(client) = client else {
+        return Ok(vec![]);
+    };
     // Pull a small page of SUI coins. This is only for benchmarking/heuristics.
     let page = client
         .coin_read_api()
@@ -678,26 +719,28 @@ async fn main() -> Result<()> {
         ),
     };
 
-    let (gas_coin_id, sender_sui_coins) = if let Some(client) = client.as_ref() {
+    let (gas_coin_id, sender_sui_coins) = {
         let gas = if matches!(args.mode, Mode::DryRun) {
-            Some(pick_gas_coin(client, sender, args.gas_coin.as_deref()).await?)
+            Some(pick_gas_coin(&client, sender, args.gas_coin.as_deref()).await?)
         } else if let Some(id_s) = args.gas_coin.as_deref() {
-            Some(resolve_object_ref(client, parse_object_id(id_s)?).await?)
+            Some(resolve_object_ref(&client, parse_object_id(id_s)?).await?)
+        } else if matches!(args.mode, Mode::BuildOnly) {
+             // For build-only, we might need a dummy gas coin ID for context?
+             // Or just pick one via mock logic.
+             Some(pick_gas_coin(&client, sender, args.gas_coin.as_deref()).await?)
         } else {
             None
         };
-        let coins = load_sender_sui_coins(client, sender).await?;
+        let coins = load_sender_sui_coins(&client, sender).await?;
         (gas.map(|r| r.0), coins)
-    } else {
-        (None, vec![])
     };
 
-    let resolve_ctx = client.as_ref().map(|client| ResolveCtx {
-        client,
+    let resolve_ctx = ResolveCtx {
+        client: &client,
         sender,
         gas_coin_id,
         sender_sui_coins,
-    });
+    };
 
     let mut ptb = ProgrammableTransactionBuilder::new();
     for call in &spec.calls {
@@ -709,7 +752,7 @@ async fn main() -> Result<()> {
             .collect::<Result<_>>()?;
         let mut call_args: Vec<Argument> = Vec::with_capacity(call.args.len());
         for a in &call.args {
-            call_args.push(resolve_argument(&mut ptb, resolve_ctx.as_ref(), a).await?);
+            call_args.push(resolve_argument(&mut ptb, Some(&resolve_ctx), a).await?);
         }
         ptb.command(Command::MoveCall(Box::new(ProgrammableMoveCall {
             package,
@@ -740,8 +783,8 @@ async fn main() -> Result<()> {
     match args.mode {
         Mode::DevInspect => {
             let tx = TransactionKind::ProgrammableTransaction(pt);
-            let client = client.as_ref().expect("client present");
-            let res = client
+            let rpc = client.as_ref().expect("client present");
+            let res = rpc
                 .read_api()
                 .dev_inspect_transaction_block(sender, tx, None, None, None)
                 .await
@@ -752,13 +795,14 @@ async fn main() -> Result<()> {
             mode_used = "dev_inspect".to_string();
         }
         Mode::DryRun => {
-            let client = client.as_ref().expect("client present");
-            let gas_price = client
+            let rpc = client.as_ref().expect("client present");
+            let gas_price = rpc
                 .read_api()
                 .get_reference_gas_price()
                 .await
                 .context("get_reference_gas_price")?;
-            let gas = pick_gas_coin(client, sender, args.gas_coin.as_deref()).await?;
+            // Pass the outer 'client' Option to pick_gas_coin
+            let gas = pick_gas_coin(&client, sender, args.gas_coin.as_deref()).await?;
             let tx_data = TransactionData::new_programmable(
                 sender,
                 vec![gas],
@@ -766,7 +810,7 @@ async fn main() -> Result<()> {
                 args.gas_budget,
                 gas_price,
             );
-            let res: DryRunTransactionBlockResponse = client
+            let res: DryRunTransactionBlockResponse = rpc
                 .read_api()
                 .dry_run_transaction_block(tx_data)
                 .await
