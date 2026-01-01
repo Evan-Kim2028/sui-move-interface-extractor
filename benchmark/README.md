@@ -24,7 +24,7 @@ Z.AI GLM-4.7 example:
 ```bash
 cp .env.example .env
 # set:
-# SMI_API_BASE_URL=https://api.z.ai/v1
+# SMI_API_BASE_URL=https://api.z.ai/api/paas/v4
 # SMI_MODEL=glm-4.7
 ```
 

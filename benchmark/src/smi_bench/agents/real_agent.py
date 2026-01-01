@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 
 import httpx
@@ -30,9 +31,16 @@ def load_real_agent_config(env_overrides: dict[str, str] | None = None) -> RealA
     env_overrides = env_overrides or {}
 
     def get(k: str, *fallbacks: str) -> str | None:
-        if k in env_overrides and env_overrides[k]:
-            return env_overrides[k]
-        return _env_get(k, *fallbacks)
+        # Precedence: real environment > .env file > fallbacks
+        for kk in (k, *fallbacks):
+            v = _env_get(kk)
+            if v:
+                return v
+        for kk in (k, *fallbacks):
+            v = env_overrides.get(kk)
+            if v:
+                return v
+        return None
 
     provider = get("SMI_PROVIDER") or "openai_compatible"
 
@@ -108,9 +116,85 @@ class RealAgent:
             ],
         }
 
-        r = self._client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        data = r.json()
+        backoff_s = 1.0
+        last_exc: Exception | None = None
+        last_status: int | None = None
+        last_body_prefix: str | None = None
+
+        def body_prefix(r: httpx.Response) -> str:
+            try:
+                t = r.text
+            except Exception:
+                return "<unavailable>"
+            t = t.replace("\n", " ").replace("\r", " ")
+            return t[:400]
+
+        def extract_api_error(r: httpx.Response) -> str | None:
+            try:
+                data = r.json()
+            except Exception:
+                return None
+            if isinstance(data, dict):
+                err = data.get("error")
+                if isinstance(err, dict):
+                    code = err.get("code")
+                    msg = err.get("message")
+                    if isinstance(code, str) and isinstance(msg, str):
+                        return f"{code}: {msg}"
+                    if isinstance(msg, str):
+                        return msg
+            return None
+
+        for attempt in range(6):
+            try:
+                r = self._client.post(url, headers=headers, json=payload)
+                last_status = r.status_code
+                last_body_prefix = body_prefix(r)
+
+                if r.status_code == 404:
+                    raise RuntimeError(f"endpoint not found (404): {url}")
+
+                if r.status_code in (401, 403):
+                    api_err = extract_api_error(r)
+                    msg = api_err or last_body_prefix or "<no body>"
+                    raise RuntimeError(f"auth failed ({r.status_code}): {msg}")
+
+                if r.status_code in (429, 500, 502, 503, 504):
+                    if r.status_code == 429:
+                        api_err = extract_api_error(r)
+                        # Some providers use 429 for non-rate-limit errors (e.g., quota/billing).
+                        if api_err and (
+                            "Insufficient balance" in api_err
+                            or "no resource package" in api_err
+                            or api_err.startswith("1113:")
+                        ):
+                            raise RuntimeError(f"provider quota/billing error: {api_err}")
+
+                    retry_after = r.headers.get("retry-after")
+                    if retry_after:
+                        try:
+                            sleep_s = float(retry_after)
+                        except Exception:
+                            sleep_s = backoff_s
+                    else:
+                        sleep_s = backoff_s
+                    time.sleep(sleep_s)
+                    backoff_s = min(backoff_s * 2, 8.0)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                break
+            except Exception as e:
+                last_exc = e
+                time.sleep(backoff_s)
+                backoff_s = min(backoff_s * 2, 8.0)
+        else:
+            extra = ""
+            if last_status is not None:
+                extra = f" last_status={last_status}"
+            if last_body_prefix:
+                extra += f" body={last_body_prefix}"
+            raise RuntimeError(f"request failed after retries.{extra}") from last_exc
 
         content = None
         try:
@@ -118,11 +202,10 @@ class RealAgent:
         except Exception:
             try:
                 content = data["choices"][0]["text"]
-            except Exception:
-                raise ValueError("unexpected response shape (missing choices[0].message.content)")
+            except Exception as e:
+                raise ValueError(f"unexpected response shape: {data}") from e
 
         if not isinstance(content, str):
             raise ValueError("unexpected response content type")
 
         return extract_type_list(content)
-
