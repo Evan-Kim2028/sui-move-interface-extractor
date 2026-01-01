@@ -226,6 +226,83 @@ def _write_checkpoint(out_path: Path, run_result: RunResult) -> None:
     tmp.replace(out_path)
 
 
+def _load_checkpoint(out_path: Path) -> RunResult:
+    try:
+        data = json.loads(out_path.read_text())
+    except Exception as e:
+        raise RuntimeError(f"failed to parse checkpoint JSON: {out_path}") from e
+
+    try:
+        schema_version = int(data["schema_version"])
+        started = int(data["started_at_unix_seconds"])
+        finished = int(data["finished_at_unix_seconds"])
+        corpus_root_name = str(data["corpus_root_name"])
+        corpus_git = data.get("corpus_git")
+        samples = int(data["samples"])
+        seed = int(data["seed"])
+        agent = str(data["agent"])
+        aggregate = data.get("aggregate")
+        packages = data.get("packages")
+    except Exception as e:
+        raise RuntimeError(f"invalid checkpoint shape: {out_path}") from e
+
+    if not isinstance(aggregate, dict) or not isinstance(packages, list):
+        raise RuntimeError(f"invalid checkpoint shape: {out_path}")
+
+    return RunResult(
+        schema_version=schema_version,
+        started_at_unix_seconds=started,
+        finished_at_unix_seconds=finished,
+        corpus_root_name=corpus_root_name,
+        corpus_git=corpus_git if isinstance(corpus_git, dict) else None,
+        samples=samples,
+        seed=seed,
+        agent=agent,
+        aggregate=aggregate,
+        packages=packages,
+    )
+
+
+def _resume_results_from_checkpoint(cp: RunResult) -> tuple[list[PackageResult], set[str], int, int]:
+    results: list[PackageResult] = []
+    seen: set[str] = set()
+    errors = cp.aggregate.get("errors") if isinstance(cp.aggregate, dict) else 0
+    try:
+        error_count = int(errors)
+    except Exception:
+        error_count = 0
+
+    for row in cp.packages:
+        if not isinstance(row, dict):
+            continue
+        pkg_id = row.get("package_id")
+        if not isinstance(pkg_id, str) or not pkg_id:
+            continue
+        score_d = row.get("score")
+        if not isinstance(score_d, dict):
+            continue
+        try:
+            score = KeyTypeScore(**score_d)
+        except Exception:
+            continue
+        truth_k = int(row.get("truth_key_types", 0))
+        pred_k = int(row.get("predicted_key_types", 0))
+        err = row.get("error")
+        results.append(
+            PackageResult(
+                package_id=pkg_id,
+                truth_key_types=truth_k,
+                predicted_key_types=pred_k,
+                score=score,
+                error=err if isinstance(err, str) else None,
+            )
+        )
+        seen.add(pkg_id)
+
+    started = cp.started_at_unix_seconds
+    return results, seen, error_count, started
+
+
 @dataclass
 class RunResult:
     schema_version: int
@@ -256,6 +333,7 @@ def run(
     continue_on_error: bool,
     max_errors: int,
     checkpoint_every: int,
+    resume: bool,
 ) -> RunResult:
     if build_rust:
         console.print("[bold]building rust…[/bold]")
@@ -287,6 +365,21 @@ def run(
     if not picked:
         raise SystemExit(f"no packages found under: {corpus_root}")
 
+    results: list[PackageResult] = []
+    error_count = 0
+    if resume:
+        if out_path is None:
+            raise SystemExit("--resume requires --out")
+        if out_path.exists():
+            cp = _load_checkpoint(out_path)
+            if cp.agent != agent_name or cp.seed != seed:
+                raise SystemExit(
+                    f"checkpoint mismatch: out has agent={cp.agent} seed={cp.seed}, expected agent={agent_name} seed={seed}"
+                )
+            results, seen, error_count, started = _resume_results_from_checkpoint(cp)
+            picked = [p for p in picked if p.package_id not in seen]
+            console.print(f"[yellow]resuming:[/yellow] already_done={len(seen)} remaining={len(picked)}")
+
     if agent_name.startswith("mock-"):
         agent = MockAgent(behavior=agent_name.replace("mock-", ""), seed=seed)
         real_agent: RealAgent | None = None
@@ -297,10 +390,8 @@ def run(
     else:
         raise SystemExit(f"unknown agent: {agent_name}")
 
-    results: list[PackageResult] = []
-    error_count = 0
-
-    for pkg_i, pkg in enumerate(track(picked, description="benchmark"), start=1):
+    done_already = len(results)
+    for pkg_i, pkg in enumerate(track(picked, description="benchmark"), start=done_already + 1):
         interface_json = _run_rust_emit_bytecode_json(Path(pkg.package_dir), rust_bin)
         truth = _extract_key_types_from_interface_json(interface_json)
         predicted: set[str] = set()
@@ -445,6 +536,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--build-rust", action="store_true")
     parser.add_argument("--out", type=Path)
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="If --out exists, resume from it (skip completed package_ids and append).",
+    )
+    parser.add_argument(
         "--env-file",
         type=Path,
         default=Path(".env"),
@@ -502,6 +598,7 @@ def main(argv: list[str] | None = None) -> None:
         continue_on_error=args.continue_on_error,
         max_errors=args.max_errors,
         checkpoint_every=args.checkpoint_every,
+        resume=args.resume,
     )
 
 
