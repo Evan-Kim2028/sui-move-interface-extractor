@@ -8,6 +8,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import httpx
 from rich.console import Console
 from rich.progress import track
 
@@ -45,6 +46,53 @@ def _run_rust_emit_bytecode_json(package_dir: Path, rust_bin: Path) -> dict:
     ]
     out = subprocess.check_output(cmd, text=True)
     return json.loads(out)
+
+
+def _redact_secret(v: str | None) -> str:
+    if not v:
+        return "<missing>"
+    suffix = v[-6:] if len(v) >= 6 else v
+    return f"len={len(v)} suffix={suffix}"
+
+
+def _doctor_real_agent(cfg_env: dict[str, str]) -> None:
+    cfg = load_real_agent_config(cfg_env)
+    console.print("[bold]Real-agent diagnostics[/bold]")
+    console.print(f"provider: {cfg.provider}")
+    console.print(f"base_url: {cfg.base_url}")
+    console.print(f"model: {cfg.model}")
+    console.print(f"api_key: {_redact_secret(cfg.api_key)}")
+
+    headers = {"Authorization": f"Bearer {cfg.api_key}"}
+    base = cfg.base_url.rstrip("/")
+
+    # Probe models listing (helps confirm auth + endpoint wiring).
+    try:
+        r = httpx.get(f"{base}/models", headers=headers, timeout=30)
+        console.print(f"GET {base}/models -> {r.status_code}")
+        if r.status_code == 200:
+            data = r.json().get("data", [])
+            ids = [m.get("id") for m in data if isinstance(m, dict)]
+            console.print(f"models: {ids}")
+        else:
+            console.print(r.text[:400])
+    except Exception as e:
+        console.print(f"[red]GET {base}/models failed:[/red] {e!r}")
+
+    # Probe one minimal chat completion.
+    payload = {"model": cfg.model, "messages": [{"role": "user", "content": "Return [] as JSON."}]}
+    try:
+        r = httpx.post(
+            f"{base}/chat/completions",
+            headers={"Content-Type": "application/json", **headers},
+            json=payload,
+            timeout=60,
+        )
+        console.print(f"POST {base}/chat/completions -> {r.status_code}")
+        console.print(r.text[:400])
+    except Exception as e:
+        console.print(f"[red]POST {base}/chat/completions failed:[/red] {e!r}")
+
 
 def _build_agent_prompt(interface_json: dict, *, max_structs: int) -> str:
     """
@@ -190,6 +238,7 @@ def run(
     env_file: Path | None,
     max_structs_in_prompt: int,
     smoke_agent: bool,
+    doctor_agent: bool,
 ) -> RunResult:
     if build_rust:
         console.print("[bold]building rust…[/bold]")
@@ -201,6 +250,10 @@ def run(
         )
 
     env_overrides = load_dotenv(env_file) if env_file is not None else {}
+
+    if doctor_agent:
+        _doctor_real_agent(env_overrides)
+        raise SystemExit(0)
 
     if smoke_agent:
         cfg = load_real_agent_config(env_overrides)
@@ -317,6 +370,11 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Run a minimal real-agent call and exit (requires env vars).",
     )
+    parser.add_argument(
+        "--doctor-agent",
+        action="store_true",
+        help="Print real-agent config (redacted) and probe /models + /chat/completions.",
+    )
     args = parser.parse_args(argv)
 
     env_file = args.env_file if args.env_file.exists() else None
@@ -337,6 +395,7 @@ def main(argv: list[str] | None = None) -> None:
         env_file=env_file,
         max_structs_in_prompt=args.max_structs_in_prompt,
         smoke_agent=args.smoke_agent,
+        doctor_agent=args.doctor_agent,
     )
 
 

@@ -34,6 +34,12 @@ Smoke test (does a single tiny API call and expects `[]` JSON):
 uv run smi-bench --corpus-root <sui-packages-checkout>/packages/mainnet_most_used --smoke-agent --agent real-openai-compatible
 ```
 
+Diagnostics (prints redacted config and probes `GET /models` + `POST /chat/completions`):
+
+```bash
+uv run smi-bench --corpus-root <sui-packages-checkout>/packages/mainnet_most_used --doctor-agent --agent real-openai-compatible
+```
+
 ### Run (mock agents)
 
 You need a local `sui-packages` checkout and a corpus root like `<sui-packages-checkout>/packages/mainnet_most_used`.
