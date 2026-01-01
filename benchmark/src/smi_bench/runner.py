@@ -217,6 +217,13 @@ class PackageResult:
     truth_key_types: int
     predicted_key_types: int
     score: KeyTypeScore
+    error: str | None = None
+
+
+def _write_checkpoint(out_path: Path, run_result: RunResult) -> None:
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(asdict(run_result), indent=2, sort_keys=True) + "\n")
+    tmp.replace(out_path)
 
 
 @dataclass
@@ -246,6 +253,9 @@ def run(
     max_structs_in_prompt: int,
     smoke_agent: bool,
     doctor_agent: bool,
+    continue_on_error: bool,
+    max_errors: int,
+    checkpoint_every: int,
 ) -> RunResult:
     if build_rust:
         console.print("[bold]building rust…[/bold]")
@@ -288,10 +298,13 @@ def run(
         raise SystemExit(f"unknown agent: {agent_name}")
 
     results: list[PackageResult] = []
+    error_count = 0
 
-    for pkg in track(picked, description="benchmark"):
+    for pkg_i, pkg in enumerate(track(picked, description="benchmark"), start=1):
         interface_json = _run_rust_emit_bytecode_json(Path(pkg.package_dir), rust_bin)
         truth = _extract_key_types_from_interface_json(interface_json)
+        predicted: set[str] = set()
+        err: str | None = None
         if real_agent is not None:
             cur_max_structs = max_structs_in_prompt
             last_err: Exception | None = None
@@ -311,9 +324,18 @@ def run(
                         continue
                     raise
             else:
-                raise RuntimeError(f"real-agent failed after prompt shrink retries: {last_err}")
+                err = f"real-agent failed after prompt shrink retries: {last_err}"
+                predicted = set()
         else:
             predicted = agent.predict_key_types(truth_key_types=truth)
+
+        if err is not None:
+            error_count += 1
+            if not continue_on_error:
+                raise RuntimeError(err)
+            if error_count > max_errors:
+                raise RuntimeError(f"too many errors ({error_count} > {max_errors}); last_error={err}")
+
         score = score_key_types(truth, predicted)
         results.append(
             PackageResult(
@@ -321,8 +343,42 @@ def run(
                 truth_key_types=len(truth),
                 predicted_key_types=len(predicted),
                 score=score,
+                error=err,
             )
         )
+
+        if out_path is not None and checkpoint_every > 0 and (pkg_i % checkpoint_every) == 0:
+            finished = int(time.time())
+            avg_f1 = sum(r.score.f1 for r in results) / len(results)
+            avg_recall = sum(r.score.recall for r in results) / len(results)
+            avg_precision = sum(r.score.precision for r in results) / len(results)
+            partial = RunResult(
+                schema_version=1,
+                started_at_unix_seconds=started,
+                finished_at_unix_seconds=finished,
+                corpus_root_name=corpus_root.name,
+                corpus_git=_git_head_for_path(corpus_root),
+                samples=len(results),
+                seed=seed,
+                agent=agent_name,
+                aggregate={
+                    "avg_precision": avg_precision,
+                    "avg_recall": avg_recall,
+                    "avg_f1": avg_f1,
+                    "errors": error_count,
+                },
+                packages=[
+                    {
+                        "package_id": r.package_id,
+                        "truth_key_types": r.truth_key_types,
+                        "predicted_key_types": r.predicted_key_types,
+                        "score": asdict(r.score),
+                        "error": r.error,
+                    }
+                    for r in results
+                ],
+            )
+            _write_checkpoint(out_path, partial)
 
     finished = int(time.time())
 
@@ -343,6 +399,7 @@ def run(
             "avg_precision": avg_precision,
             "avg_recall": avg_recall,
             "avg_f1": avg_f1,
+            "errors": error_count,
         },
         packages=[
             {
@@ -350,6 +407,7 @@ def run(
                 "truth_key_types": r.truth_key_types,
                 "predicted_key_types": r.predicted_key_types,
                 "score": asdict(r.score),
+                "error": r.error,
             }
             for r in results
         ],
@@ -357,7 +415,7 @@ def run(
 
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(json.dumps(asdict(run_result), indent=2, sort_keys=True) + "\n")
+        _write_checkpoint(out_path, run_result)
 
     return run_result
 
@@ -399,6 +457,23 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="Print real-agent config (redacted) and probe /models + /chat/completions.",
     )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Continue benchmark even if a package fails (records error and scores it as empty prediction).",
+    )
+    parser.add_argument(
+        "--max-errors",
+        type=int,
+        default=25,
+        help="Stop the run if more than this many package errors occur (with --continue-on-error).",
+    )
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=10,
+        help="Write partial results to --out every N packages (0 disables).",
+    )
     args = parser.parse_args(argv)
 
     env_file = args.env_file if args.env_file.exists() else None
@@ -420,6 +495,9 @@ def main(argv: list[str] | None = None) -> None:
         max_structs_in_prompt=args.max_structs_in_prompt,
         smoke_agent=args.smoke_agent,
         doctor_agent=args.doctor_agent,
+        continue_on_error=args.continue_on_error,
+        max_errors=args.max_errors,
+        checkpoint_every=args.checkpoint_every,
     )
 
 
