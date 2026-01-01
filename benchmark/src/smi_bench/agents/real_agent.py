@@ -123,7 +123,7 @@ class RealAgent:
         )
         return self.complete_type_list(prompt)
 
-    def complete_type_list(self, prompt: str) -> set[str]:
+    def complete_type_list(self, prompt: str, *, timeout_s: float | None = None) -> set[str]:
         url = f"{self.cfg.base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {self.cfg.api_key}"}
         payload = {
@@ -151,6 +151,7 @@ class RealAgent:
         last_exc: Exception | None = None
         last_status: int | None = None
         last_body_prefix: str | None = None
+        deadline = (time.monotonic() + timeout_s) if timeout_s is not None else None
 
         def body_prefix(r: httpx.Response) -> str:
             try:
@@ -177,8 +178,16 @@ class RealAgent:
             return None
 
         for attempt in range(6):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("per-call timeout exceeded")
             try:
-                r = self._client.post(url, headers=headers, json=payload)
+                req_timeout = None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("per-call timeout exceeded")
+                    req_timeout = max(1.0, remaining)
+                r = self._client.post(url, headers=headers, json=payload, timeout=req_timeout)
                 last_status = r.status_code
                 last_body_prefix = body_prefix(r)
 
@@ -212,6 +221,11 @@ class RealAgent:
                             sleep_s = backoff_s
                     else:
                         sleep_s = backoff_s
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError("per-call timeout exceeded")
+                        sleep_s = min(sleep_s, max(0.0, remaining))
                     time.sleep(sleep_s)
                     backoff_s = min(backoff_s * 2, 8.0)
                     continue
@@ -220,7 +234,13 @@ class RealAgent:
                 break
             except Exception as e:
                 last_exc = e
-                time.sleep(backoff_s)
+                sleep_s = backoff_s
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("per-call timeout exceeded") from last_exc
+                    sleep_s = min(sleep_s, max(0.0, remaining))
+                time.sleep(sleep_s)
                 backoff_s = min(backoff_s * 2, 8.0)
         else:
             extra = ""

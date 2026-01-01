@@ -218,6 +218,10 @@ class PackageResult:
     predicted_key_types: int
     score: KeyTypeScore
     error: str | None = None
+    elapsed_seconds: float | None = None
+    attempts: int | None = None
+    max_structs_used: int | None = None
+    timed_out: bool | None = None
 
 
 def _write_checkpoint(out_path: Path, run_result: RunResult) -> None:
@@ -334,6 +338,7 @@ def run(
     max_errors: int,
     checkpoint_every: int,
     resume: bool,
+    per_package_timeout_seconds: float,
 ) -> RunResult:
     if build_rust:
         console.print("[bold]building rust…[/bold]")
@@ -392,22 +397,37 @@ def run(
 
     done_already = len(results)
     for pkg_i, pkg in enumerate(track(picked, description="benchmark"), start=done_already + 1):
+        pkg_started = time.monotonic()
+        deadline = pkg_started + per_package_timeout_seconds
         interface_json = _run_rust_emit_bytecode_json(Path(pkg.package_dir), rust_bin)
         truth = _extract_key_types_from_interface_json(interface_json)
         predicted: set[str] = set()
         err: str | None = None
+        attempts = 0
+        max_structs_used: int | None = None
+        timed_out = False
         if real_agent is not None:
             cur_max_structs = max_structs_in_prompt
             last_exc: Exception | None = None
             for _attempt in range(4):
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    last_exc = TimeoutError(f"per-package timeout exceeded ({per_package_timeout_seconds}s)")
+                    break
                 prompt = _build_agent_prompt(interface_json, max_structs=cur_max_structs)
                 try:
-                    predicted = real_agent.complete_type_list(prompt)
+                    attempts += 1
+                    max_structs_used = cur_max_structs
+                    remaining = max(0.0, deadline - time.monotonic())
+                    predicted = real_agent.complete_type_list(prompt, timeout_s=max(1.0, remaining))
                     last_exc = None
                     break
                 except Exception as e:
                     last_exc = e
                     msg = str(e)
+                    if isinstance(e, TimeoutError):
+                        timed_out = True
+                        break
                     if isinstance(e, ValueError) and ("empty content" in msg or "hit max_tokens" in msg):
                         next_max = max(5, cur_max_structs // 2)
                         if next_max == cur_max_structs:
@@ -432,6 +452,7 @@ def run(
                 raise RuntimeError(f"too many errors ({error_count} > {max_errors}); last_error={err}")
 
         score = score_key_types(truth, predicted)
+        elapsed_s = time.monotonic() - pkg_started
         results.append(
             PackageResult(
                 package_id=pkg.package_id,
@@ -439,6 +460,10 @@ def run(
                 predicted_key_types=len(predicted),
                 score=score,
                 error=err,
+                elapsed_seconds=elapsed_s,
+                attempts=attempts,
+                max_structs_used=max_structs_used,
+                timed_out=timed_out,
             )
         )
 
@@ -469,6 +494,10 @@ def run(
                         "predicted_key_types": r.predicted_key_types,
                         "score": asdict(r.score),
                         "error": r.error,
+                        "elapsed_seconds": r.elapsed_seconds,
+                        "attempts": r.attempts,
+                        "max_structs_used": r.max_structs_used,
+                        "timed_out": r.timed_out,
                     }
                     for r in results
                 ],
@@ -503,6 +532,10 @@ def run(
                 "predicted_key_types": r.predicted_key_types,
                 "score": asdict(r.score),
                 "error": r.error,
+                "elapsed_seconds": r.elapsed_seconds,
+                "attempts": r.attempts,
+                "max_structs_used": r.max_structs_used,
+                "timed_out": r.timed_out,
             }
             for r in results
         ],
@@ -547,6 +580,12 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to a dotenv file (default: .env in the current working directory).",
     )
     parser.add_argument("--max-structs-in-prompt", type=int, default=200)
+    parser.add_argument(
+        "--per-package-timeout-seconds",
+        type=float,
+        default=120.0,
+        help="Maximum wall-clock time to spend per package (real-agent mode).",
+    )
     parser.add_argument(
         "--smoke-agent",
         action="store_true",
@@ -599,6 +638,7 @@ def main(argv: list[str] | None = None) -> None:
         max_errors=args.max_errors,
         checkpoint_every=args.checkpoint_every,
         resume=args.resume,
+        per_package_timeout_seconds=args.per_package_timeout_seconds,
     )
 
 
