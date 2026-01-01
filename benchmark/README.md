@@ -60,3 +60,16 @@ uv run smi-bench \
 ### Output
 
 The runner writes a small JSON report with per-package metrics and an aggregate summary.
+
+### Phase II scaffold (type inhabitation)
+
+`smi-inhabit` is a scaffold for the future “PTB type inhabitation” benchmark (build PTB → devInspect → score by created key types).
+
+For now it supports only a fixture-based devInspect JSON (to validate scoring and wiring):
+
+```bash
+uv run smi-inhabit \
+  --bytecode-package-dir /path/to/sui-packages/packages/mainnet/0x00/00000000000000000000000000000000000000000000000000000000000002 \
+  --fixture-dev-inspect-json fixtures/dev_inspect_example.json \
+  --agent mock-empty
+```

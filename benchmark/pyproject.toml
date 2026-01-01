@@ -11,6 +11,7 @@ dependencies = [
 
 [project.scripts]
 smi-bench = "smi_bench.runner:main"
+smi-inhabit = "smi_bench.inhabit_runner:main"
 
 [dependency-groups]
 dev = [
