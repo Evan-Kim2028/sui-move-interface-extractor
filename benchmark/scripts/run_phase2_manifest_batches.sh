@@ -49,6 +49,7 @@ fi
 while true; do
   echo "[$(date -Iseconds)] running Phase II batch size=$BATCH_SIZE (resume -> next batch)..."
   args=(
+    --parent-pid "$$"
     --corpus-root "$CORPUS_ROOT"
     --package-ids-file "$MANIFEST_IDS_FILE"
     --samples "$BATCH_SIZE"

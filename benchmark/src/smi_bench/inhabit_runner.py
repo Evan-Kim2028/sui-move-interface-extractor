@@ -1,5 +1,22 @@
 from __future__ import annotations
 
+"""
+Phase II benchmark runner (type inhabitation).
+
+High-level responsibilities:
+- Derive targets (key structs) from bytecode-derived interface JSON (via the Rust extractor).
+- Produce PTB plans using one of:
+  - baseline-search (deterministic heuristics over entry functions),
+  - template-search (baseline skeleton + LLM fills args), or
+  - real-openai-compatible (LLM plans directly with progressive exposure).
+- Simulate the PTB via Rust helper `smi_tx_sim` (dry-run / dev-inspect / build-only).
+- Score by comparing created object types vs target key types using *base-type* matching.
+
+Maintainability notes:
+- The control flow is intentionally “tiered”: parse/schema → build → execute → score.
+- For “official” evals, prefer `--simulation-mode dry-run --require-dry-run` to avoid weaker fallbacks.
+"""
+
 import argparse
 import copy
 import json
@@ -8,6 +25,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 from rich.console import Console
@@ -24,14 +42,79 @@ from smi_bench.inhabit.executable_subset import (
 from smi_bench.inhabit.score import InhabitationScore, normalize_type_string, score_inhabitation
 from smi_bench.logging import JsonlLogger, default_run_id
 from smi_bench.runner import _extract_key_types_from_interface_json
+from smi_bench.rust import default_rust_binary, emit_bytecode_json, validate_rust_binary
+from smi_bench.schema import validate_phase2_run_json
+from smi_bench.utils import compute_json_checksum, ensure_temp_dir, safe_json_loads, validate_binary
 
 console = Console()
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        # Signal 0 does not kill the process; it checks existence/permission.
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but we might not be allowed to signal it.
+        return True
+    else:
+        return True
+
+
+def _check_run_guards(*, parent_pid: int | None, run_deadline: float | None) -> None:
+    if parent_pid is not None and parent_pid > 0 and not _pid_is_alive(parent_pid):
+        raise RuntimeError(
+            f"Parent process exited (pid={parent_pid})\n"
+            f"  The benchmark run will stop to prevent orphaned execution.\n"
+            f"  This is expected if the parent process was terminated."
+        )
+    if run_deadline is not None and time.monotonic() >= run_deadline:
+        raise TimeoutError(
+            f"Maximum run time exceeded\n"
+            f"  Deadline: {run_deadline:.1f}s\n"
+            f"  Current: {time.monotonic():.1f}s\n"
+            f"  The benchmark run has been stopped to respect the time limit."
+        )
+
+def _run_rust_emit_bytecode_json(bytecode_package_dir: Path, rust_bin: Path) -> dict[str, Any]:
+    """
+    Backward-compatible shim for older code/tests.
+
+    Historically, Phase II used a local helper named `_run_rust_emit_bytecode_json(...)`.
+    We now centralize the logic in `smi_bench.rust.emit_bytecode_json`, but keep this
+    wrapper to avoid drift in call sites and to preserve stable patch targets in tests.
+    
+    Args:
+        bytecode_package_dir: Path to bytecode package directory.
+        rust_bin: Path to Rust extractor binary.
+    
+    Returns:
+        Parsed interface JSON dict.
+    """
+    return emit_bytecode_json(package_dir=bytecode_package_dir, rust_bin=rust_bin)
 
 
 def _fetch_inventory(rpc_url: str, sender: str) -> dict[str, list[str]]:
     """
     Fetch owned objects for sender and group by type.
-    Returns: { "TypeStr": ["0xID1", "0xID2"] }
+    
+    Used to resolve placeholder arguments in PTB plans. Fetches all owned objects
+    via paginated RPC calls and groups them by normalized type string.
+    
+    Args:
+        rpc_url: Sui RPC endpoint URL.
+        sender: Sender address (must start with "0x").
+    
+    Returns:
+        Dict mapping normalized type strings to lists of object IDs.
+        Example: {"0x2::coin::Coin<0x2::sui::SUI>": ["0xID1", "0xID2"]}
+    
+    Note:
+        Returns empty dict on any error (network, RPC, parsing) to keep function
+        side-effect-free and simplify testing.
     """
     if sender == "0x0" or not sender.startswith("0x"):
         return {}
@@ -78,15 +161,25 @@ def _fetch_inventory(rpc_url: str, sender: str) -> dict[str, list[str]]:
                     inventory[t_norm] = []
                 inventory[t_norm].append(oid)
         return inventory
-    except Exception:
-        # Fail gracefully on inventory fetch (network issues)
+    except (httpx.RequestError, httpx.HTTPStatusError, httpx.TimeoutException, ValueError, KeyError):
+        # Fail gracefully on inventory fetch (network issues, RPC errors, or malformed response).
+        # Note: keep this function side-effect-free (no logger dependency) to simplify testing.
         return {}
 
 
-def _resolve_placeholders(ptb_spec: dict, inventory: dict[str, list[str]]) -> bool:
+def _resolve_placeholders(ptb_spec: dict[str, Any], inventory: dict[str, list[str]]) -> bool:
     """
-    Replace {"$smi_placeholder": "Type"} args with {"imm_or_owned_object": "ID"} from inventory.
-    Returns True if all placeholders were resolved, False otherwise.
+    Replace placeholder arguments in PTB spec with actual object IDs from inventory.
+    
+    Resolves {"$smi_placeholder": "Type"} arguments by finding matching objects
+    in the inventory and replacing with {"imm_or_owned_object": "ID"}.
+    
+    Args:
+        ptb_spec: PTB specification dict (modified in-place).
+        inventory: Dict mapping normalized type strings to object ID lists.
+    
+    Returns:
+        True if all placeholders were resolved, False otherwise.
     """
     resolved_all = True
 
@@ -121,6 +214,20 @@ def _resolve_placeholders(ptb_spec: dict, inventory: dict[str, list[str]]) -> bo
 
 
 def _parse_gas_budget_ladder(s: str) -> list[int]:
+    """
+    Parse gas budget ladder string into list of integers.
+    
+    Format: comma-separated integers, e.g., "1000000,5000000,10000000"
+    
+    Args:
+        s: Comma-separated gas budget values.
+    
+    Returns:
+        List of gas budget integers in ascending order.
+    
+    Raises:
+        ValueError: If string format is invalid.
+    """
     """
     Parse a comma-separated list of integer gas budgets.
 
@@ -172,6 +279,17 @@ def _resolve_sender_and_gas_coin(
     gas_coin: str | None,
     env_overrides: dict[str, str],
 ) -> tuple[str, str | None]:
+    """
+    Resolve sender address and gas coin from args or environment.
+    
+    Args:
+        sender: Sender address from args (None = use env or default).
+        gas_coin: Gas coin ID from args (None = use env or None).
+        env_overrides: Environment variable overrides dict.
+    
+    Returns:
+        Tuple of (resolved_sender, resolved_gas_coin).
+    """
     resolved_sender = sender or env_overrides.get("SMI_SENDER") or "0x0"
     resolved_gas_coin = gas_coin or env_overrides.get("SMI_GAS_COIN")
     return resolved_sender, resolved_gas_coin
@@ -187,7 +305,20 @@ _INT_ARG_KEYS: tuple[str, ...] = (
 )
 
 
-def _rewrite_ptb_addresses_in_place(ptb_spec: dict, *, sender: str) -> bool:
+def _rewrite_ptb_addresses_in_place(ptb_spec: dict[str, Any], *, sender: str) -> bool:
+    """
+    Rewrite address arguments in PTB spec to use sender address.
+    
+    Modifies PTB spec in-place, replacing address arguments with sender address.
+    Used to create address-rewritten variants of PTB plans.
+    
+    Args:
+        ptb_spec: PTB specification dict (modified in-place).
+        sender: Sender address to use for rewriting.
+    
+    Returns:
+        True if any addresses were changed, False otherwise.
+    """
     """
     Heuristic rewrite: replace any `address` / `vector_address` args with `sender`.
 
@@ -216,7 +347,20 @@ def _rewrite_ptb_addresses_in_place(ptb_spec: dict, *, sender: str) -> bool:
     return changed
 
 
-def _rewrite_ptb_ints_in_place(ptb_spec: dict, *, value: int) -> bool:
+def _rewrite_ptb_ints_in_place(ptb_spec: dict[str, Any], *, value: int) -> bool:
+    """
+    Rewrite integer arguments in PTB spec to a specific value.
+    
+    Modifies PTB spec in-place, replacing integer arguments with the specified value.
+    Used to create integer-rewritten variants of PTB plans.
+    
+    Args:
+        ptb_spec: PTB specification dict (modified in-place).
+        value: Integer value to use for rewriting.
+    
+    Returns:
+        True if any integers were changed, False otherwise.
+    """
     """
     Heuristic rewrite: replace any integer-typed pure args with `value`.
 
@@ -241,19 +385,30 @@ def _rewrite_ptb_ints_in_place(ptb_spec: dict, *, value: int) -> bool:
     return changed
 
 
-def _ptb_variants(base_spec: dict, *, sender: str, max_variants: int) -> list[tuple[str, dict]]:
+def _ptb_variants(base_spec: dict[str, Any], *, sender: str, max_variants: int) -> list[tuple[str, dict[str, Any]]]:
     """
-    Deterministic, bounded PTB variants to allow local adaptation within a fixed per-package budget.
-
-    This is intentionally conservative to keep corpus runs fast and diff-stable.
+    Generate deterministic, bounded PTB variants for local adaptation.
+    
+    Creates variants by modifying addresses and integer arguments in the base spec.
+    This allows the benchmark to try multiple approaches within a fixed budget
+    without making LLM calls.
+    
+    Args:
+        base_spec: Base PTB specification dict.
+        sender: Sender address for address rewriting.
+        max_variants: Maximum number of variants to return.
+    
+    Returns:
+        List of (variant_name, spec_dict) tuples. Variants are deterministic
+        and bounded to keep corpus runs fast and diff-stable.
     """
     if max_variants <= 0:
         return []
 
-    variants: list[tuple[str, dict]] = []
+    variants: list[tuple[str, dict[str, Any]]] = []
     seen: set[str] = set()
 
-    def _add(name: str, spec: dict) -> None:
+    def _add(name: str, spec: dict[str, Any]) -> None:
         key = json.dumps(spec, sort_keys=True, separators=(",", ":"))
         if key in seen:
             return
@@ -276,6 +431,15 @@ def _ptb_variants(base_spec: dict, *, sender: str, max_variants: int) -> list[tu
 
 
 def _summarize_inventory(inventory: dict[str, list[str]]) -> str:
+    """
+    Format inventory dict as a human-readable string for LLM prompts.
+    
+    Args:
+        inventory: Dict mapping type strings to object ID lists.
+    
+    Returns:
+        Formatted string describing owned objects grouped by type.
+    """
     if not inventory:
         return "Your inventory is empty or could not be fetched."
     lines = ["You own the following objects (grouped by type):"]
@@ -288,34 +452,12 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def _default_rust_binary() -> Path:
-    exe = "sui_move_interface_extractor.exe" if os.name == "nt" else "sui_move_interface_extractor"
-    local = _repo_root() / "target" / "release" / exe
-    if local.exists():
-        return local
-    return Path("/usr/local/bin") / exe
-
-
 def _default_dev_inspect_binary() -> Path:
     exe = "smi_tx_sim.exe" if os.name == "nt" else "smi_tx_sim"
     local = _repo_root() / "target" / "release" / exe
     if local.exists():
         return local
     return Path("/usr/local/bin") / exe
-
-
-def _run_rust_emit_bytecode_json(bytecode_package_dir: Path, rust_bin: Path) -> dict:
-    out = subprocess.check_output(
-        [
-            str(rust_bin),
-            "--bytecode-package-dir",
-            str(bytecode_package_dir),
-            "--emit-bytecode-json",
-            "-",
-        ],
-        text=True,
-    )
-    return json.loads(out)
 
 
 def _load_plan_file(path: Path) -> dict[str, dict]:
@@ -348,14 +490,46 @@ def _run_tx_sim_via_helper(
     gas_budget: int | None,
     gas_coin: str | None,
     bytecode_package_dir: Path | None,
-    ptb_spec: dict,
+    ptb_spec: dict[str, Any],
     timeout_s: float,
-) -> tuple[dict | None, set[str], set[str], str]:
+) -> tuple[dict[str, Any] | None, set[str], set[str], str]:
+    """
+    Run transaction simulation via Rust helper with proper temp file cleanup.
+    
+    Writes PTB spec to a temporary file, invokes the Rust helper binary, and
+    parses the response. Always cleans up the temp file, even on error.
+    
+    Args:
+        dev_inspect_bin: Path to smi_tx_sim binary.
+        rpc_url: Sui RPC endpoint URL.
+        sender: Sender address.
+        mode: Simulation mode ("dry-run", "dev-inspect", "build-only").
+        gas_budget: Gas budget for transaction (optional).
+        gas_coin: Gas coin object ID (optional).
+        bytecode_package_dir: Path to bytecode package directory (optional).
+        ptb_spec: PTB specification dict.
+        timeout_s: Timeout in seconds for subprocess call.
+    
+    Returns:
+        Tuple of (tx_output_dict, created_types_set, static_types_set, mode_used).
+        tx_output_dict may be None if simulation failed.
+    
+    Raises:
+        TimeoutError: If subprocess times out.
+        RuntimeError: If subprocess fails or returns invalid JSON.
+    """
     # Write a temporary PTB spec file (small, single package).
-    tmp_dir = _repo_root() / "benchmark" / ".tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = ensure_temp_dir(_repo_root() / "benchmark" / ".tmp")
     tmp_path = tmp_dir / f"ptb_spec_{int(time.time() * 1000)}.json"
-    tmp_path.write_text(json.dumps(ptb_spec, indent=2, sort_keys=True) + "\n")
+    try:
+        tmp_path.write_text(json.dumps(ptb_spec, indent=2, sort_keys=True) + "\n")
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to write temp PTB spec: {tmp_path}\n"
+            f"  Error: {e}\n"
+            f"  Check disk space and write permissions for: {tmp_path.parent}"
+        ) from e
+
     try:
         cmd = [
             str(dev_inspect_bin),
@@ -374,10 +548,42 @@ def _run_tx_sim_via_helper(
             cmd += ["--gas-coin", gas_coin]
         if bytecode_package_dir is not None:
             cmd += ["--bytecode-package-dir", str(bytecode_package_dir)]
-        out = subprocess.check_output(cmd, text=True, timeout=timeout_s)
-        data = json.loads(out)
+        try:
+            out = subprocess.check_output(cmd, text=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired as e:
+            raise TimeoutError(
+                f"Transaction simulation timed out after {timeout_s}s\n"
+                f"  Mode: {mode}\n"
+                f"  RPC: {rpc_url}\n"
+                f"  This may indicate network issues or a very complex transaction."
+            ) from e
+        except subprocess.CalledProcessError as e:
+            stderr_snippet = (e.stderr[:200] if e.stderr else "N/A") if hasattr(e, 'stderr') else "N/A"
+            raise RuntimeError(
+                f"Transaction simulation failed\n"
+                f"  Exit code: {e.returncode}\n"
+                f"  Mode: {mode}\n"
+                f"  Command: {' '.join(e.cmd)}\n"
+                f"  Stderr: {stderr_snippet}\n"
+                f"  Check RPC connectivity and transaction validity."
+            ) from e
+
+        try:
+            data = safe_json_loads(out, context=f"transaction simulation output ({mode})")
+        except ValueError as e:
+            raise RuntimeError(
+                f"Invalid JSON from transaction simulation helper\n"
+                f"  Output context: {mode}\n"
+                f"  Error: {e}\n"
+                f"  The helper may have crashed or returned malformed output."
+            ) from e
+
         if not isinstance(data, dict):
-            raise RuntimeError("dev-inspect helper returned non-object JSON")
+            raise RuntimeError(
+                f"Dev-inspect helper returned non-object JSON\n"
+                f"  Expected dict, got {type(data).__name__}\n"
+                f"  The helper output format may have changed."
+            )
         mode_used = data.get("modeUsed") if isinstance(data.get("modeUsed"), str) else "unknown"
         created_types = data.get("createdObjectTypes")
         static_types = data.get("staticCreatedObjectTypes")
@@ -398,10 +604,45 @@ def _run_tx_sim_via_helper(
 
         return tx_out, created_set, static_set, mode_used
     finally:
+        # Always clean up temp file
         try:
-            tmp_path.unlink()
+            if tmp_path.exists():
+                tmp_path.unlink()
         except Exception:
+            # Best-effort cleanup; log but don't fail
             pass
+
+
+def _persist_ptb_spec_for_debug(
+    *,
+    logger: JsonlLogger | None,
+    package_id: str,
+    plan_attempt: int,
+    plan_variant: str | None,
+    sim_attempt: int,
+    ptb_spec: dict[str, Any],
+) -> None:
+    """
+    Persist PTB spec to debug directory for inspection.
+    
+    Writes PTB spec to a file in the debug directory for post-mortem analysis.
+    Only writes if logger is provided (debug mode enabled).
+    
+    Args:
+        logger: Logger instance (if None, function does nothing).
+        package_id: Package ID being processed.
+        plan_attempt: Plan attempt number.
+        plan_variant: Plan variant name (e.g., "base", "addr_sender").
+        sim_attempt: Simulation attempt number.
+        ptb_spec: PTB specification dict to persist.
+    """
+    if logger is None:
+        return
+    out_dir = logger.paths.root / "ptb_specs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    variant = plan_variant or "base"
+    out_path = out_dir / f"{package_id}_plan{plan_attempt}_{variant}_sim{sim_attempt}.json"
+    out_path.write_text(json.dumps(ptb_spec, indent=2, sort_keys=True) + "\n")
 
 
 def _run_tx_sim_with_fallback(
@@ -412,10 +653,32 @@ def _run_tx_sim_with_fallback(
     gas_budget: int | None,
     gas_coin: str | None,
     bytecode_package_dir: Path | None,
-    ptb_spec: dict,
+    ptb_spec: dict[str, Any],
     timeout_s: float,
     require_dry_run: bool,
-) -> tuple[dict | None, set[str], set[str], str, bool, bool, str | None]:
+) -> tuple[dict[str, Any] | None, set[str], set[str], str, bool, bool, str | None]:
+    """
+    Run transaction simulation with fallback from dry-run to dev-inspect.
+    
+    Tries dry-run first, then falls back to dev-inspect if dry-run fails and
+    require_dry_run is False. This provides graceful degradation for packages
+    that can't be dry-run but can be dev-inspected.
+    
+    Args:
+        sim_bin: Path to smi_tx_sim binary.
+        rpc_url: Sui RPC endpoint URL.
+        sender: Sender address.
+        gas_budget: Gas budget for transaction (optional).
+        gas_coin: Gas coin object ID (optional).
+        bytecode_package_dir: Path to bytecode package directory (optional).
+        ptb_spec: PTB specification dict.
+        timeout_s: Timeout in seconds for subprocess call.
+        require_dry_run: If True, don't fall back to dev-inspect on dry-run failure.
+    
+    Returns:
+        Tuple of (tx_output_dict, created_types_set, static_types_set, mode_used,
+        dry_run_ok, fell_back_to_dev_inspect, dry_run_error).
+    """
     """
     Attempt dry-run first to get transaction-ground-truth created types.
     If dry-run fails and require_dry_run is false, fall back to dev-inspect (static types only).
@@ -434,17 +697,19 @@ def _run_tx_sim_with_fallback(
         )
         # If dry-run succeeded, created types should already be present.
         return tx_out, created, static_created, mode_used, False, True, None
-    except Exception as e:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, ValueError, TimeoutError) as e:
         if require_dry_run:
             raise
         dry_run_err = str(e)
 
     # Dev-inspect fallback: we still call the helper in dev-inspect mode to keep outputs consistent,
     # but scoring relies on static types because dev-inspect does not include object type strings.
-    tmp_dir = _repo_root() / "benchmark" / ".tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = ensure_temp_dir(_repo_root() / "benchmark" / ".tmp")
     tmp_path = tmp_dir / f"ptb_spec_{int(time.time() * 1000)}.json"
-    tmp_path.write_text(json.dumps(ptb_spec, indent=2, sort_keys=True) + "\n")
+    try:
+        tmp_path.write_text(json.dumps(ptb_spec, indent=2, sort_keys=True) + "\n")
+    except Exception as e:
+        raise RuntimeError(f"failed to write temp PTB spec for dev-inspect fallback: {tmp_path}") from e
     try:
         cmd = [
             str(sim_bin),
@@ -464,9 +729,14 @@ def _run_tx_sim_with_fallback(
         if bytecode_package_dir is not None:
             cmd += ["--bytecode-package-dir", str(bytecode_package_dir)]
         out = subprocess.check_output(cmd, text=True, timeout=timeout_s)
-        data = json.loads(out)
+        data = safe_json_loads(out, context=f"tx sim helper output ({mode})")
         if not isinstance(data, dict):
-            raise RuntimeError("tx sim helper returned non-object JSON")
+            raise RuntimeError(
+                f"Tx sim helper returned non-object JSON\n"
+                f"  Expected dict, got {type(data).__name__}\n"
+                f"  Mode: {mode}\n"
+                f"  The helper output format may have changed."
+            )
         mode_used = data.get("modeUsed") if isinstance(data.get("modeUsed"), str) else "unknown"
         created_types = data.get("createdObjectTypes")
         static_types = data.get("staticCreatedObjectTypes")
@@ -476,9 +746,14 @@ def _run_tx_sim_with_fallback(
         static_set = {t for t in static_types if isinstance(t, str) and t} if isinstance(static_types, list) else set()
         return None, created_set, static_set, mode_used, True, False, dry_run_err
     finally:
+        # Always clean up temp file
         try:
-            tmp_path.unlink()
-        except Exception:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except (OSError, PermissionError) as e:
+            # Best-effort cleanup; log but don't fail
+            if logger is not None:
+                logger.event("temp_file_cleanup_failed", path=str(tmp_path), error=str(e))
             pass
 
 
@@ -488,9 +763,23 @@ def _build_real_agent_prompt(
     target_key_types: set[str],
     interface_summary: str,
     inventory_summary: str,
+    max_planning_calls: int,
 ) -> str:
     """
-    Prompt the model to output a PTB spec JSON matching the Rust helper schema.
+    Build prompt for LLM to generate PTB spec JSON.
+    
+    The prompt instructs the model to create a Programmable Transaction Block plan
+    that will inhabit (create) as many target key types as possible.
+    
+    Args:
+        package_id: Package ID being targeted.
+        target_key_types: Set of key type strings to create.
+        interface_summary: Formatted summary of available functions in package.
+        inventory_summary: Formatted summary of owned objects.
+        max_planning_calls: Maximum number of planning calls allowed.
+    
+    Returns:
+        Complete prompt string for the LLM.
     """
     instructions = (
         "You are an expert Move developer crafting a Programmable Transaction Block (PTB) plan.\n"
@@ -510,9 +799,15 @@ def _build_real_agent_prompt(
         '"args":[{"u64":1},{"vector_u8_utf8":"hi"},{"imm_or_owned_object":"0xID"},...] }]}\n'
         "- Use 'imm_or_owned_object' for objects you own.\n"
         '- Use \'shared_object\' for shared objects: {"shared_object": {"id": "0x...", "mutable": true}}\n'
+        "- NEVER use arg kinds named 'object' or 'object_id' (unsupported).\n"
+        "  If you have an object id, use 'imm_or_owned_object' instead.\n"
         "- Do not include tx_context arguments (implicit).\n"
-        "CRITICAL: If the function name is missing, you MUST INFER it from the API list above. "
-        "Do NOT ask for clarification. Output a valid JSON plan attempt.\n"
+        "### Progressive Exposure (IMPORTANT)\n"
+        "You may request more interface details if needed by returning ONLY this JSON object:\n"
+        '{"need_more":["0xADDR::module::function",...],"reason":"..."}\n'
+        f"You have at most {max_planning_calls} planning calls total for this package; prefer succeeding in 1.\n"
+        "If you do not need more details, return ONLY a PTB JSON plan matching the schema.\n"
+        "CRITICAL: Do NOT ask natural-language questions. Output either a PTB plan OR a need_more JSON object.\n"
     )
     payload = {"package_id": package_id, "target_key_types": sorted(target_key_types)}
     return instructions + json.dumps(payload, indent=2, sort_keys=True)
@@ -522,10 +817,25 @@ def _build_real_agent_retry_prompt(
     *,
     package_id: str,
     target_key_types: set[str],
-    last_failure: dict[str, object],
+    last_failure: dict[str, Any],
+    interface_summary: str | None = None,
+    max_planning_calls: int | None = None,
 ) -> str:
     """
-    Provide a failure-aware retry prompt so the agent can adapt within the per-package timeout.
+    Build failure-aware retry prompt for LLM adaptation.
+    
+    Creates a prompt that includes information about the last failure, allowing
+    the agent to adapt its approach within the per-package timeout.
+    
+    Args:
+        package_id: Package ID being targeted.
+        target_key_types: Set of key type strings to create.
+        last_failure: Dict with failure details (harness_error, dry_run_effects_error, etc.).
+        interface_summary: Optional formatted summary of available functions.
+        max_planning_calls: Optional maximum planning calls remaining.
+    
+    Returns:
+        Retry prompt string with failure context.
     """
     error_detail = ""
     if "harness_error" in last_failure:
@@ -535,16 +845,26 @@ def _build_real_agent_retry_prompt(
         effects_err = last_failure["dry_run_effects_error"]
         error_detail = f"The transaction was built but failed on-chain simulation: {effects_err}\n"
 
+    extra_iface = ""
+    if interface_summary:
+        extra_iface = "\n### Available Functions (Focused)\n" + interface_summary + "\n"
+
+    budget_line = ""
+    if max_planning_calls is not None:
+        budget_line = f"You have at most {max_planning_calls} planning calls total; prefer succeeding now.\n"
+
     instructions = (
         "Your previous PTB plan failed.\n"
         f"{error_detail}"
         "\nRevise the PTB plan to avoid the failure.\n"
+        f"{extra_iface}"
+        f"{budget_line}"
         "Return ONLY valid JSON matching this schema:\n"
         '{"calls":[{"target":"0xADDR::module::function","type_args":["<TypeTag>",...],'
         '"args":[{"u64":1},{"vector_u8_utf8":"hi"},...] }]}\n'
+        "Do NOT use arg kinds named 'object' or 'object_id' (unsupported).\n"
         "Do not include tx_context arguments (they are implicit).\n"
-        "CRITICAL: Try a different function or argument strategy. You MUST INFER a valid attempt. "
-        "Do NOT ask for clarification.\n"
+        "CRITICAL: Output a valid JSON plan attempt. Do NOT ask for clarification.\n"
     )
     payload = {
         "package_id": package_id,
@@ -604,10 +924,29 @@ class InhabitPackageResult:
     sim_attempts: int | None = None
     gas_budget_used: int | None = None
     plan_variant: str | None = None
+    schema_violation_count: int | None = None
+    schema_violation_attempts_until_first_valid: int | None = None
+    semantic_failure_count: int | None = None
+    semantic_failure_attempts_until_first_success: int | None = None
 
 
 @dataclass
 class InhabitRunResult:
+    """
+    Phase II benchmark run result (schema contract).
+
+    Schema versioning:
+    - Increment `schema_version` when adding/removing/renaming fields or changing semantics.
+    - Backward compatibility: older readers should handle missing optional fields gracefully.
+    - Determinism: `packages` list order should be stable (sorted by package_id) for reproducible diffs.
+
+    Field contracts:
+    - `schema_version`: integer, must match expected version for strict validation.
+    - `aggregate`: dict with keys like `"avg_hit_rate"`, `"packages_total"`, `"packages_with_hits"`, `"errors"`, `"timeouts"`.
+    - `packages`: list of dicts, each with `"package_id"`, `"score"` (InhabitationScore dict), plus simulation metadata.
+    - Simulation metadata fields (`dry_run_ok`, `fell_back_to_dev_inspect`, etc.) indicate evidence quality for scoring.
+    """
+
     schema_version: int
     started_at_unix_seconds: int
     finished_at_unix_seconds: int
@@ -619,23 +958,113 @@ class InhabitRunResult:
     sender: str
     gas_budget: int
     gas_coin: str | None
-    aggregate: dict
-    packages: list[dict]
+    aggregate: dict[str, Any]
+    packages: list[dict[str, Any]]
 
 
 def _write_checkpoint(out_path: Path, run_result: InhabitRunResult) -> None:
+    """
+    Write checkpoint atomically with checksum validation.
+    
+    Uses a temporary file (.tmp suffix) and atomic replace to ensure checkpoint
+    integrity. Validates schema before writing and adds checksum for corruption detection.
+    Always cleans up .tmp file on failure.
+    
+    Args:
+        out_path: Path to checkpoint file.
+        run_result: Run result to serialize.
+    
+    Raises:
+        ValueError: If schema validation fails.
+        OSError: If file write fails.
+    """
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(asdict(run_result), indent=2, sort_keys=True) + "\n")
-    tmp.replace(out_path)
+    try:
+        data = asdict(run_result)
+        # Validate schema before writing
+        validate_phase2_run_json(data)
+        # Add checksum for corruption detection
+        checksum = compute_json_checksum(data)
+        data["_checksum"] = checksum
+        json_str = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        tmp.write_text(json_str)
+        tmp.replace(out_path)
+    except Exception:
+        # Clean up .tmp file on failure to prevent accumulation
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass  # Best-effort cleanup
+        raise
 
 
 def _load_checkpoint(out_path: Path) -> InhabitRunResult:
+    """
+    Load checkpoint with checksum validation.
+    
+    Reads checkpoint file, validates checksum if present, and deserializes to InhabitRunResult.
+    Provides detailed error messages for common failure modes.
+    
+    Args:
+        out_path: Path to checkpoint file.
+    
+    Returns:
+        Deserialized InhabitRunResult.
+    
+    Raises:
+        FileNotFoundError: If checkpoint file doesn't exist.
+        RuntimeError: If file read fails, JSON parse fails, checksum mismatch, or invalid shape.
+    """
     try:
-        data = json.loads(out_path.read_text())
-    except Exception as e:
-        raise RuntimeError(f"failed to parse checkpoint JSON: {out_path}") from e
-    if not isinstance(data, dict) or not isinstance(data.get("packages"), list):
-        raise RuntimeError(f"invalid checkpoint shape: {out_path}")
+        text = out_path.read_text()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Checkpoint file not found: {out_path}\n"
+            f"  Did you mean to run without --resume?\n"
+            f"  Or check that the file path is correct."
+        ) from exc
+    except (OSError, PermissionError) as exc:
+        raise RuntimeError(
+            f"Failed to read checkpoint file: {out_path}\n"
+            f"  Error: {exc}\n"
+            f"  Check file permissions and disk space."
+        ) from exc
+
+    try:
+        data = safe_json_loads(text, context=f"checkpoint file {out_path}")
+    except ValueError as e:
+        raise RuntimeError(
+            f"Checkpoint JSON parse error: {out_path}\n"
+            f"  {e}\n"
+            f"  The checkpoint file may be corrupted. Consider removing it and restarting."
+        ) from e
+
+    # Validate checksum if present
+    stored_checksum = data.pop("_checksum", None)
+    if stored_checksum:
+        computed_checksum = compute_json_checksum(data)
+        if stored_checksum != computed_checksum:
+            raise RuntimeError(
+                f"Checkpoint checksum mismatch: {out_path}\n"
+                f"  Stored checksum: {stored_checksum}\n"
+                f"  Computed checksum: {computed_checksum}\n"
+                f"  This indicates file corruption.\n"
+                f"  Fix: Remove the checkpoint file and restart without --resume."
+            )
+
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Invalid checkpoint shape: {out_path}\n"
+            f"  Expected top-level dict, got {type(data).__name__}\n"
+            f"  The checkpoint file may be corrupted or from an incompatible version."
+        )
+    if not isinstance(data.get("packages"), list):
+        raise RuntimeError(
+            f"Invalid checkpoint shape: {out_path}\n"
+            f"  Expected 'packages' to be list, got {type(data.get('packages')).__name__}\n"
+            f"  The checkpoint file may be corrupted or from an incompatible version."
+        )
     return InhabitRunResult(
         schema_version=int(data["schema_version"]),
         started_at_unix_seconds=int(data["started_at_unix_seconds"]),
@@ -655,13 +1084,29 @@ def _load_checkpoint(out_path: Path) -> InhabitRunResult:
 
 def _resume_results_from_checkpoint(
     cp: InhabitRunResult,
+    *,
+    logger: JsonlLogger | None = None,
 ) -> tuple[list[InhabitPackageResult], set[str], int, int]:
+    """
+    Resume package results from a checkpoint.
+    
+    Extracts completed packages from checkpoint and reconstructs InhabitPackageResult objects.
+    Gracefully skips malformed package rows and logs skip events.
+    
+    Args:
+        cp: Checkpoint InhabitRunResult to resume from.
+        logger: Optional logger for skip events.
+    
+    Returns:
+        Tuple of (results_list, seen_package_ids_set, error_count, started_timestamp).
+    """
     results: list[InhabitPackageResult] = []
     seen: set[str] = set()
     errors = cp.aggregate.get("errors") if isinstance(cp.aggregate, dict) else 0
     try:
-        error_count = int(errors)
-    except Exception:
+        error_count = int(errors) if errors is not None else 0
+    except (ValueError, TypeError):
+        # Invalid error count format; default to 0
         error_count = 0
 
     for row in cp.packages:
@@ -675,7 +1120,10 @@ def _resume_results_from_checkpoint(
             continue
         try:
             score = InhabitationScore(**score_d)
-        except Exception:
+        except (TypeError, ValueError) as e:
+            # Log but continue - malformed score shouldn't break resume
+            if logger is not None and pkg_id:
+                logger.event("checkpoint_resume_skip", package_id=pkg_id, reason=f"invalid score: {e}")
             continue
         sim_mode = row.get("simulation_mode")
         fell_back = row.get("fell_back_to_dev_inspect")
@@ -706,6 +1154,7 @@ def run(
     gas_budget: int,
     gas_coin: str | None,
     gas_budget_ladder: str,
+    max_planning_calls: int,
     max_plan_attempts: int,
     baseline_max_candidates: int,
     max_heuristic_variants: int,
@@ -722,18 +1171,22 @@ def run(
     simulation_mode: str,
     log_dir: Path | None,
     run_id: str | None,
+    parent_pid: int | None = None,
+    max_run_seconds: float | None = None,
 ) -> InhabitRunResult:
-    if not rust_bin.exists():
-        raise SystemExit(f"rust binary not found: {rust_bin} (run `cargo build --release --locked` at repo root)")
-    if not dev_inspect_bin.exists():
-        raise SystemExit(
-            "dev-inspect helper binary not found: "
-            f"{dev_inspect_bin} (run `cargo build --release --locked` at repo root)"
-        )
+    # Validate binaries exist and are executable
+    try:
+        rust_bin = validate_rust_binary(rust_bin)
+    except (FileNotFoundError, PermissionError) as e:
+        raise SystemExit(str(e)) from e
+    try:
+        dev_inspect_bin = validate_binary(dev_inspect_bin, binary_name="dev-inspect helper binary")
+    except (FileNotFoundError, PermissionError) as e:
+        raise SystemExit(str(e)) from e
 
     env_overrides = load_dotenv(env_file) if env_file is not None else {}
     sender, gas_coin = _resolve_sender_and_gas_coin(sender=sender, gas_coin=gas_coin, env_overrides=env_overrides)
-    plan_by_id: dict[str, dict] = {}
+    plan_by_id: dict[str, dict[str, Any]] = {}
     if plan_file is not None:
         plan_by_id = _load_plan_file(plan_file)
 
@@ -743,6 +1196,7 @@ def run(
         logger = JsonlLogger(base_dir=log_dir, run_id=rid)
 
     started = int(time.time())
+    run_deadline = (time.monotonic() + float(max_run_seconds)) if max_run_seconds is not None else None
     if logger is not None:
         logger.write_run_metadata(
             {
@@ -759,6 +1213,8 @@ def run(
                 "simulation_mode": simulation_mode,
                 "max_plan_attempts": max_plan_attempts,
                 "max_heuristic_variants": max_heuristic_variants,
+                "parent_pid": parent_pid,
+                "max_run_seconds": max_run_seconds,
                 "argv": list(map(str, os.sys.argv)),
             }
         )
@@ -795,7 +1251,7 @@ def run(
                 )
             if cp.gas_coin != gas_coin:
                 raise SystemExit(f"checkpoint mismatch: out has gas_coin={cp.gas_coin}, expected gas_coin={gas_coin}")
-            results, seen, error_count, started = _resume_results_from_checkpoint(cp)
+            results, seen, error_count, started = _resume_results_from_checkpoint(cp, logger=logger)
             picked = [p for p in picked if p.package_id not in seen]
             console.print(f"[yellow]resuming:[/yellow] already_done={len(seen)} remaining={len(picked)}")
 
@@ -808,9 +1264,13 @@ def run(
     if agent_name == "real-openai-compatible":
         cfg = load_real_agent_config(env_overrides)
         real_agent = RealAgent(cfg)
+        if logger is not None:
+            logger.event("agent_effective_config", **real_agent.debug_effective_config())
     elif agent_name == "template-search":
         cfg = load_real_agent_config(env_overrides)
         real_agent = RealAgent(cfg)
+        if logger is not None:
+            logger.event("agent_effective_config", **real_agent.debug_effective_config())
     elif agent_name in {"mock-empty", "mock-planfile", "baseline-search"}:
         pass
     else:
@@ -820,9 +1280,20 @@ def run(
     for pkg_i, pkg in enumerate(track(picked, description="phase2"), start=done_already + 1):
         pkg_started = time.monotonic()
         deadline = pkg_started + per_package_timeout_seconds
+        # First guard check per-package (so if we stop immediately, we still emit a consistent row).
+        pkg_guard_error: str | None = None
+        pkg_guard_timed_out = False
+        try:
+            _check_run_guards(parent_pid=parent_pid, run_deadline=run_deadline)
+        except TimeoutError as e:
+            pkg_guard_error = str(e)
+            pkg_guard_timed_out = True
+        except RuntimeError as e:
+            pkg_guard_error = str(e)
         if logger is not None:
             logger.event("package_started", package_id=pkg.package_id, i=pkg_i)
 
+        # Use the shim so tests can patch the symbol and we keep a single “hook point”.
         iface = _run_rust_emit_bytecode_json(Path(pkg.package_dir), rust_bin)
         truth_key_types = _extract_key_types_from_interface_json(iface)
 
@@ -847,12 +1318,20 @@ def run(
         gas_budget_used: int | None = None
         plan_variant: str | None = None
 
+        schema_violation_count = 0
+        schema_violation_attempts_until_first_valid: int | None = None
+        semantic_failure_count = 0
+        semantic_failure_attempts_until_first_success: int | None = None
+
         inventory = {}
         needs_inventory = agent_name in {"baseline-search", "real-openai-compatible", "template-search"}
         if needs_inventory and sender and sender != "0x0":
             inventory = _fetch_inventory(rpc_url, sender)
 
         try:
+            if pkg_guard_error is not None:
+                raise TimeoutError(pkg_guard_error) if pkg_guard_timed_out else RuntimeError(pkg_guard_error)
+
             ladder = _parse_gas_budget_ladder(gas_budget_ladder)
             budgets = _gas_budgets_to_try(base=gas_budget, ladder=ladder)
 
@@ -875,7 +1354,11 @@ def run(
             elif agent_name == "mock-planfile":
                 ptb = plan_by_id.get(pkg.package_id)
                 if ptb is None:
-                    raise RuntimeError(f"no PTB plan in --plan-file for package_id={pkg.package_id}")
+                    raise RuntimeError(
+                        f"No PTB plan found in plan file for package: {pkg.package_id}\n"
+                        f"  Plan file: {plan_file}\n"
+                        f"  Ensure the plan file contains an entry for this package_id."
+                    )
                 plans_to_try = [ptb]
             else:
                 plans_to_try = [None] * max(1, int(max_plan_attempts))
@@ -887,6 +1370,7 @@ def run(
             best_score: InhabitationScore | None = None
 
             for plan_i, plan_item in enumerate(plans_to_try):
+                _check_run_guards(parent_pid=parent_pid, run_deadline=run_deadline)
                 plan_attempts = plan_i + 1
                 remaining = max(0.0, deadline - time.monotonic())
                 if remaining <= 0:
@@ -914,20 +1398,71 @@ def run(
                         ptb_spec_base = copy.deepcopy(plan_item)
                     else:
                         assert real_agent is not None
-                        if last_failure_ctx is None or plan_i == 0:
-                            prompt = _build_real_agent_prompt(
-                                package_id=pkg.package_id,
-                                target_key_types=truth_key_types,
-                                interface_summary=summarize_interface(iface),
-                                inventory_summary=_summarize_inventory(inventory),
+
+                        planning_calls_used = 0
+                        requested_targets: set[str] | None = None
+                        while True:
+                            _check_run_guards(parent_pid=parent_pid, run_deadline=run_deadline)
+                            planning_calls_used += 1
+                            if planning_calls_used > max(1, int(max_planning_calls)):
+                                # This is not a timeout: the model opted into progressive exposure too many times.
+                                raise RuntimeError(
+                                    f"Maximum planning calls exceeded: {planning_calls_used} > {max_planning_calls}\n"
+                                    f"  Package: {pkg.package_id}\n"
+                                    f"  Increase --max-planning-calls or simplify the planning task."
+                                )
+
+                            if requested_targets:
+                                iface_summary = summarize_interface(
+                                    iface,
+                                    max_functions=200,
+                                    mode="focused",
+                                    requested_targets=requested_targets,
+                                )
+                            else:
+                                iface_summary = summarize_interface(iface, max_functions=60, mode="entry_only")
+
+                            if last_failure_ctx is None or plan_i == 0:
+                                prompt = _build_real_agent_prompt(
+                                    package_id=pkg.package_id,
+                                    target_key_types=truth_key_types,
+                                    interface_summary=iface_summary,
+                                    inventory_summary=_summarize_inventory(inventory),
+                                    max_planning_calls=int(max_planning_calls),
+                                )
+                            else:
+                                prompt = _build_real_agent_retry_prompt(
+                                    package_id=pkg.package_id,
+                                    target_key_types=truth_key_types,
+                                    last_failure=last_failure_ctx,
+                                    interface_summary=iface_summary,
+                                    max_planning_calls=int(max_planning_calls),
+                                )
+
+                            remaining = max(0.0, deadline - time.monotonic())
+                            if remaining <= 0:
+                                raise TimeoutError(f"per-package timeout exceeded ({per_package_timeout_seconds}s)")
+
+                            ptb_spec_base = real_agent.complete_json(
+                                prompt,
+                                timeout_s=max(1.0, remaining),
+                                logger=logger,
+                                log_context={
+                                    "package_id": pkg.package_id,
+                                    "plan_attempt": plan_attempts,
+                                    "planning_call": planning_calls_used,
+                                },
                             )
-                        else:
-                            prompt = _build_real_agent_retry_prompt(
-                                package_id=pkg.package_id,
-                                target_key_types=truth_key_types,
-                                last_failure=last_failure_ctx,
-                            )
-                        ptb_spec_base = real_agent.complete_json(prompt, timeout_s=max(1.0, remaining))
+                            # IMPORTANT: treat the progressive "need_more" handshake as non-fatal.
+                            # Otherwise models that always request more details will get counted as a timeout.
+                            if isinstance(ptb_spec_base, dict) and "need_more" in ptb_spec_base:
+                                need_more = ptb_spec_base.get("need_more")
+                                if isinstance(need_more, list):
+                                    requested_targets = {t for t in need_more if isinstance(t, str) and t}
+                                    if requested_targets:
+                                        last_failure_ctx = None
+                                        continue
+                            break
 
                     # Resolve any remaining placeholders from inventory
                     if "$smi_placeholder" in json.dumps(ptb_spec_base):
@@ -958,6 +1493,7 @@ def run(
                 for variant_name, ptb_spec in variants:
                     plan_variant = variant_name
                     for attempt_i, budget in enumerate(budgets, start=1):
+                        _check_run_guards(parent_pid=parent_pid, run_deadline=run_deadline)
                         sim_attempts += 1
                         gas_budget_used = budget
                         remaining = max(0.0, deadline - time.monotonic())
@@ -986,25 +1522,51 @@ def run(
                         attempt_dry_run_error = None
 
                         if simulation_mode == "dry-run":
-                            (
-                                tx_out,
-                                attempt_created_types,
-                                attempt_static_types,
-                                sim_mode,
-                                fell_back,
-                                _rpc_ok,
-                                attempt_dry_run_error,
-                            ) = _run_tx_sim_with_fallback(
-                                sim_bin=dev_inspect_bin,
-                                rpc_url=rpc_url,
-                                sender=sender,
-                                gas_budget=budget,
-                                gas_coin=gas_coin,
-                                bytecode_package_dir=Path(pkg.package_dir),
-                                ptb_spec=ptb_spec,
-                                timeout_s=max(1.0, remaining),
-                                require_dry_run=require_dry_run,
-                            )
+                            try:
+                                (
+                                    tx_out,
+                                    attempt_created_types,
+                                    attempt_static_types,
+                                    sim_mode,
+                                    fell_back,
+                                    _rpc_ok,
+                                    attempt_dry_run_error,
+                                ) = _run_tx_sim_with_fallback(
+                                    sim_bin=dev_inspect_bin,
+                                    rpc_url=rpc_url,
+                                    sender=sender,
+                                    gas_budget=budget,
+                                    gas_coin=gas_coin,
+                                    bytecode_package_dir=Path(pkg.package_dir),
+                                    ptb_spec=ptb_spec,
+                                    timeout_s=max(1.0, remaining),
+                                    require_dry_run=require_dry_run,
+                                )
+                            except Exception as e:
+                                _persist_ptb_spec_for_debug(
+                                    logger=logger,
+                                    package_id=pkg.package_id,
+                                    plan_attempt=plan_attempts,
+                                    plan_variant=plan_variant,
+                                    sim_attempt=attempt_i,
+                                    ptb_spec=ptb_spec,
+                                )
+                                # Treat tx-sim failures (schema/tool) as retryable plan failures.
+                                schema_violation_count += 1
+                                if schema_violation_attempts_until_first_valid is None:
+                                    schema_violation_attempts_until_first_valid = plan_attempts
+                                last_failure_ctx = {"harness_error": str(e)}
+                                if logger is not None:
+                                    logger.event(
+                                        "sim_attempt_harness_error",
+                                        package_id=pkg.package_id,
+                                        i=pkg_i,
+                                        plan_attempt=plan_attempts,
+                                        plan_variant=plan_variant,
+                                        sim_attempt=attempt_i,
+                                        error=str(e),
+                                    )
+                                break  # break gas loop
                             tx_build_ok = True
                             dev_inspect_ok = bool(fell_back)
                             if isinstance(tx_out, dict):
@@ -1097,6 +1659,8 @@ def run(
 
                         if simulation_mode != "dry-run" or attempt_dry_run_ok:
                             last_failure_ctx = None
+                            if semantic_failure_attempts_until_first_success is None:
+                                semantic_failure_attempts_until_first_success = plan_attempts
                             break  # break gas loop (success)
 
                         if attempt_i < len(budgets) and _is_retryable_gas_error(attempt_dry_run_effects_error):
@@ -1110,7 +1674,13 @@ def run(
                             "gas_budget_used": budget,
                             "plan_variant": plan_variant,
                         }
+                        if attempt_dry_run_ok is False and attempt_dry_run_effects_error is not None:
+                            semantic_failure_count += 1
                         break  # break gas loop (failed, not retryable)
+
+                    if last_failure_ctx is not None and "harness_error" in last_failure_ctx:
+                        # tx-sim failure already logged + persisted; move to next plan attempt.
+                        break
 
                     # Check break from gas loop
                     if best_score and best_score.created_hits == best_score.targets and best_score.targets > 0:
@@ -1160,12 +1730,23 @@ def run(
         score = score_inhabitation(target_key_types=truth_key_types, created_object_types=created_types)
         elapsed_s = time.monotonic() - pkg_started
 
-        if err is not None:
+        schema_only_failure = err is None and schema_violation_count > 0
+        if schema_only_failure:
+            err = f"schema violations: {schema_violation_count}"
+
+        # Only count schema-only failures as package errors if they exhausted the plan-attempt budget.
+        count_as_error = err is not None and (
+            (not schema_only_failure) or (schema_violation_count >= max(1, int(max_plan_attempts)))
+        )
+        if count_as_error:
             error_count += 1
             if not continue_on_error:
                 raise SystemExit(f"package failed: {pkg.package_id}: {err}")
             if error_count > max_errors:
                 raise SystemExit(f"too many errors: {error_count} > {max_errors}")
+
+        if err is None and schema_violation_count > 0:
+            err = f"schema violations: {schema_violation_count}"
 
         results.append(
             InhabitPackageResult(
@@ -1191,8 +1772,15 @@ def run(
                 sim_attempts=sim_attempts,
                 gas_budget_used=gas_budget_used,
                 plan_variant=plan_variant,
+                schema_violation_count=schema_violation_count,
+                schema_violation_attempts_until_first_valid=schema_violation_attempts_until_first_valid,
+                semantic_failure_count=semantic_failure_count,
+                semantic_failure_attempts_until_first_success=semantic_failure_attempts_until_first_success,
             )
         )
+        # If this package ended due to a run-level guard, stop the run after writing the row.
+        if pkg_guard_error is not None:
+            break
         if logger is not None:
             row = {
                 "package_id": pkg.package_id,
@@ -1216,6 +1804,10 @@ def run(
                 "sim_attempts": sim_attempts,
                 "gas_budget_used": gas_budget_used,
                 "plan_variant": plan_variant,
+                "schema_violation_count": schema_violation_count,
+                "schema_violation_attempts_until_first_valid": schema_violation_attempts_until_first_valid,
+                "semantic_failure_count": semantic_failure_count,
+                "semantic_failure_attempts_until_first_success": semantic_failure_attempts_until_first_success,
             }
             if include_created_types:
                 row["created_object_types_list"] = sorted(created_types)
@@ -1235,9 +1827,12 @@ def run(
 
         if out_path is not None and checkpoint_every > 0 and (pkg_i % checkpoint_every) == 0:
             finished = int(time.time())
-            avg_hit_rate = sum(
-                (r.score.created_hits / r.score.targets) if r.score.targets else 0.0 for r in results
-            ) / len(results)
+            if len(results) > 0:
+                avg_hit_rate = sum(
+                    (r.score.created_hits / r.score.targets) if r.score.targets else 0.0 for r in results
+                ) / len(results)
+            else:
+                avg_hit_rate = 0.0
             partial = InhabitRunResult(
                 schema_version=2,
                 started_at_unix_seconds=started,
@@ -1285,9 +1880,31 @@ def run(
             _write_checkpoint(out_path, partial)
 
     finished = int(time.time())
-    avg_hit_rate = sum((r.score.created_hits / r.score.targets) if r.score.targets else 0.0 for r in results) / len(
-        results
-    )
+    hit_rates = [(r.score.created_hits / r.score.targets) if r.score.targets else 0.0 for r in results]
+    if len(results) > 0:
+        avg_hit_rate = sum(hit_rates) / len(results)
+        schema_violation_attempts = sum(1 for r in results if (r.schema_violation_count or 0) > 0)
+        schema_violation_rate = schema_violation_attempts / len(results)
+        semantic_failure_attempts = sum(1 for r in results if (r.semantic_failure_count or 0) > 0)
+        semantic_failure_rate = semantic_failure_attempts / len(results)
+    else:
+        avg_hit_rate = 0.0
+        schema_violation_rate = 0.0
+        semantic_failure_rate = 0.0
+        schema_violation_attempts = 0
+        semantic_failure_attempts = 0
+    max_hit_rate = max(hit_rates) if hit_rates else 0.0
+    schema_violation_count = sum(int(r.schema_violation_count or 0) for r in results)
+    schema_violation_attempts_until_first_valid = [
+        int(v)
+        for r in results
+        if (v := r.schema_violation_attempts_until_first_valid) is not None and (r.schema_violation_count or 0) > 0
+    ]
+
+    semantic_failure_count = sum(int(r.semantic_failure_count or 0) for r in results)
+    semantic_failure_attempts_until_first_success = [
+        int(v) for r in results if (v := r.semantic_failure_attempts_until_first_success) is not None
+    ]
 
     run_result = InhabitRunResult(
         schema_version=2,
@@ -1303,7 +1920,16 @@ def run(
         gas_coin=gas_coin,
         aggregate={
             "avg_hit_rate": avg_hit_rate,
+            "max_hit_rate": max_hit_rate,
+            "schema_violation_rate": schema_violation_rate,
+            "schema_violation_attempts": schema_violation_attempts,
+            "schema_violation_count": schema_violation_count,
+            "schema_violation_attempts_until_first_valid": schema_violation_attempts_until_first_valid,
             "errors": error_count,
+            "semantic_failure_rate": semantic_failure_rate,
+            "semantic_failure_attempts": semantic_failure_attempts,
+            "semantic_failure_count": semantic_failure_count,
+            "semantic_failure_attempts_until_first_success": semantic_failure_attempts_until_first_success,
         },
         packages=[
             {
@@ -1349,7 +1975,8 @@ def run(
 
     console.print(
         "phase2 avg_hit_rate="
-        f"{run_result.aggregate.get('avg_hit_rate'):.3f} errors={run_result.aggregate.get('errors')}"
+        f"{run_result.aggregate.get('avg_hit_rate'):.3f} max_hit_rate={run_result.aggregate.get('max_hit_rate'):.3f} "
+        f"errors={run_result.aggregate.get('errors')}"
     )
     return run_result
 
@@ -1365,6 +1992,21 @@ def main(argv: list[str] | None = None) -> None:
         help="Optional file of package ids to restrict to (1 per line; '#' comments allowed).",
     )
     p.add_argument(
+        "--dataset",
+        type=str,
+        help="Named dataset under manifests/datasets/<name>.txt (ignored if --package-ids-file is set).",
+    )
+    p.add_argument(
+        "--subset",
+        type=str,
+        help="Deprecated alias for --dataset.",
+    )
+    p.add_argument(
+        "--prefer-signal-package-ids",
+        action="store_true",
+        help="If set and --package-ids-file is not provided, use results/signal_ids_hit_ge_1.txt when it exists.",
+    )
+    p.add_argument(
         "--agent",
         type=str,
         default="mock-empty",
@@ -1377,7 +2019,7 @@ def main(argv: list[str] | None = None) -> None:
         ],
     )
     p.add_argument("--plan-file", type=Path, help="JSON mapping package_id -> PTB spec (required for mock-planfile).")
-    p.add_argument("--rust-bin", type=Path, default=_default_rust_binary())
+    p.add_argument("--rust-bin", type=Path, default=default_rust_binary())
     p.add_argument("--dev-inspect-bin", type=Path, default=_default_dev_inspect_binary())
     p.add_argument("--rpc-url", type=str, default="https://fullnode.mainnet.sui.io:443")
     p.add_argument(
@@ -1406,8 +2048,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument(
         "--max-plan-attempts",
         type=int,
-        default=2,
+        default=5,
         help="Max PTB replanning attempts per package (real agent only).",
+    )
+    p.add_argument(
+        "--max-planning-calls",
+        type=int,
+        default=50,
+        help="Maximum LLM planning calls per package for progressive exposure (2-3 recommended).",
     )
     p.add_argument(
         "--baseline-max-candidates",
@@ -1474,6 +2122,18 @@ def main(argv: list[str] | None = None) -> None:
         help="Path to a dotenv file (default: .env in the current working directory).",
     )
     p.add_argument(
+        "--parent-pid",
+        type=int,
+        default=None,
+        help="If set, exit the run when this PID no longer exists (prevents orphaned spend).",
+    )
+    p.add_argument(
+        "--max-run-seconds",
+        type=float,
+        default=None,
+        help="If set, exit the run after this many wall-clock seconds.",
+    )
+    p.add_argument(
         "--log-dir",
         type=Path,
         default=Path("logs"),
@@ -1482,6 +2142,20 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--run-id", type=str, help="Optional run id for log directory naming.")
     p.add_argument("--no-log", action="store_true", help="Disable JSONL logging.")
     args = p.parse_args(argv)
+
+    dataset_name = args.dataset or args.subset
+    if args.dataset and args.subset:
+        raise SystemExit("Use only one of --dataset or --subset")
+    if args.package_ids_file is None and dataset_name:
+        dataset_path = Path("manifests") / "datasets" / f"{dataset_name}.txt"
+        if not dataset_path.exists():
+            raise SystemExit(f"unknown dataset: {dataset_name} (missing {dataset_path})")
+        args.package_ids_file = dataset_path
+
+    if args.package_ids_file is None and args.prefer_signal_package_ids:
+        signal = Path("results/signal_ids_hit_ge_1.txt")
+        if signal.exists():
+            args.package_ids_file = signal
 
     env_file = args.env_file if args.env_file.exists() else None
     if env_file is None:
@@ -1508,6 +2182,7 @@ def main(argv: list[str] | None = None) -> None:
         gas_budget=args.gas_budget,
         gas_coin=args.gas_coin,
         gas_budget_ladder=args.gas_budget_ladder,
+        max_planning_calls=args.max_planning_calls,
         max_plan_attempts=args.max_plan_attempts,
         baseline_max_candidates=args.baseline_max_candidates,
         max_heuristic_variants=args.max_heuristic_variants,
@@ -1524,6 +2199,8 @@ def main(argv: list[str] | None = None) -> None:
         simulation_mode=args.simulation_mode,
         log_dir=None if args.no_log else args.log_dir,
         run_id=args.run_id,
+        parent_pid=args.parent_pid,
+        max_run_seconds=args.max_run_seconds,
     )
 
 

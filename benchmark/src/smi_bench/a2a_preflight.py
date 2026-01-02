@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import argparse
+import socket
+import subprocess
+from pathlib import Path
+
+import httpx
+
+
+def _check_path_exists(label: str, path: Path) -> None:
+    if not path.exists():
+        raise SystemExit(f"missing: {label}={path}")
+
+
+def _check_rpc_reachable(rpc_url: str, *, timeout_s: float) -> None:
+    try:
+        with httpx.Client(timeout=timeout_s) as client:
+            r = client.post(rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": "rpc.discover", "params": []})
+            # Some endpoints may not implement discover; any HTTP response is enough.
+            _ = r.status_code
+    except Exception as e:
+        raise SystemExit(f"rpc_unreachable: {rpc_url} ({type(e).__name__}: {e})")
+
+
+def _is_listening(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except Exception:
+        return False
+
+
+def main(argv: list[str] | None = None) -> None:
+    p = argparse.ArgumentParser(description="Preflight checks before a full Phase II run")
+    p.add_argument(
+        "--corpus-root",
+        type=Path,
+        required=True,
+        help="Path to sui-packages/packages/mainnet_most_used",
+    )
+    p.add_argument(
+        "--rust-binary",
+        type=Path,
+        default=Path("../target/release/smi_tx_sim"),
+        help="Path to smi_tx_sim (relative to benchmark/)",
+    )
+    p.add_argument("--rpc-url", type=str, default="https://fullnode.mainnet.sui.io:443")
+    p.add_argument(
+        "--green-url",
+        type=str,
+        default="http://127.0.0.1:9999/",
+        help="Green agent A2A endpoint",
+    )
+    p.add_argument(
+        "--scenario",
+        type=str,
+        default=None,
+        help="Scenario directory to start servers if not already listening",
+    )
+    p.add_argument(
+        "--package-ids-file",
+        type=str,
+        default="manifests/standard_phase2_no_framework.txt",
+        help="Package id list (manifest) relative to benchmark/",
+    )
+    p.add_argument("--samples", type=int, default=1)
+    p.add_argument("--per-package-timeout-seconds", type=float, default=90)
+    p.add_argument("--timeout-seconds", type=float, default=5.0)
+    args = p.parse_args(argv)
+
+    _check_path_exists("corpus_root", args.corpus_root)
+    _check_path_exists("rust_binary", args.rust_binary)
+    _check_rpc_reachable(args.rpc_url, timeout_s=args.timeout_seconds)
+
+    if args.scenario and not _is_listening("127.0.0.1", 9999):
+        subprocess.Popen(
+            ["uv", "run", "smi-agentbeats-scenario", args.scenario, "--launch-mode", "current"],
+            cwd=str(Path.cwd()),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    # Smoke request via existing smoke tool (which also validates bundle shape).
+    cmd = [
+        "uv",
+        "run",
+        "smi-a2a-smoke",
+        "--green-url",
+        args.green_url,
+        "--corpus-root",
+        str(args.corpus_root),
+        "--package-ids-file",
+        args.package_ids_file,
+        "--samples",
+        str(args.samples),
+        "--per-package-timeout-seconds",
+        str(args.per_package_timeout_seconds),
+        "--rpc-url",
+        args.rpc_url,
+    ]
+    if args.scenario:
+        cmd.extend(["--scenario", args.scenario])
+    subprocess.run(cmd, check=True)
+
+    print("ready_for_full_run")
+
+
+if __name__ == "__main__":
+    main()

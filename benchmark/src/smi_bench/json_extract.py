@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import re
 
+from smi_bench.utils import safe_json_loads
+
 
 class JsonExtractError(ValueError):
     pass
@@ -28,8 +30,8 @@ def extract_json_value(text: str) -> object:
     """
     s = _strip_code_fences(text)
     try:
-        return json.loads(s)
-    except Exception:
+        return safe_json_loads(s, context="model response JSON extraction")
+    except ValueError:
         pass
 
     # Try to find the first top-level JSON array/object substring.
@@ -42,8 +44,8 @@ def extract_json_value(text: str) -> object:
             continue
         candidate = s[start : end + 1]
         try:
-            return json.loads(candidate)
-        except Exception:
+            return safe_json_loads(candidate, context=f"extracted JSON substring ({opener}...{closer})")
+        except ValueError:
             continue
 
     raise JsonExtractError("no JSON found in model output")

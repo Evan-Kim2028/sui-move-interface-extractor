@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import os
 import time
 from dataclasses import dataclass
 
 import httpx
 
-from smi_bench.json_extract import extract_json_value, extract_type_list
+from smi_bench.json_extract import extract_type_list
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,8 @@ class RealAgentConfig:
     thinking: str | None
     response_format: str | None
     clear_thinking: bool | None
+    min_request_timeout_s: float | None = None
+    max_request_retries: int | None = None
 
 
 def _env_get(*keys: str) -> str | None:
@@ -43,24 +46,68 @@ def load_real_agent_config(env_overrides: dict[str, str] | None = None) -> RealA
     env_overrides = env_overrides or {}
 
     def get(k: str, *fallbacks: str) -> str | None:
-        # Precedence: real environment > .env file > fallbacks
+        """
+        Resolve config values across multiple possible env var keys.
+
+        Semantics:
+        - We have an ordered list of keys (k + fallbacks) in *priority order*.
+        - We pick the *first key* that exists in either process env or env_overrides.
+        - For that chosen key, process env wins over env_overrides (so operators can override
+          a stable .env without editing files).
+        """
+        # Keys that should be overrideable only via process env (operator override).
+        # This helps scripts/CI force values without editing .env files.
+        operator_env_wins = {"SMI_API_KEY", "SMI_API_BASE_URL"}
+
         for kk in (k, *fallbacks):
-            v = _env_get(kk)
+            v_env = _env_get(kk)
+            v_override = env_overrides.get(kk)
+            if not (v_env or v_override):
+                continue
+            if kk in operator_env_wins:
+                return v_env or v_override
+            return v_override or v_env
+        return None
+
+    def get_api_key() -> str | None:
+        """
+        Resolve API keys with a policy that avoids ambient-provider leakage during tests.
+
+        Rules:
+        - If SMI_API_KEY is set in process env, it wins (operator override).
+        - Otherwise, if SMI_API_KEY is set in env_overrides, use it.
+        - For other provider keys, explicit env_overrides wins over process env so that a passed
+          dotenv/config dict can deterministically select a provider even if the environment has
+          another provider key present (common in dev shells / CI).
+        """
+        # Highest-priority "global" key
+        v = _env_get("SMI_API_KEY")
+        if v:
+            return v
+        v = env_overrides.get("SMI_API_KEY")
+        if v:
+            return v
+
+        # Provider-specific fallbacks (prefer overrides over env for determinism)
+        for k in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "ZAI_API_KEY", "ZHIPUAI_API_KEY"):
+            v = env_overrides.get(k)
             if v:
                 return v
-        for kk in (k, *fallbacks):
-            v = env_overrides.get(kk)
+            v = _env_get(k)
             if v:
                 return v
         return None
 
     provider = get("SMI_PROVIDER") or "openai_compatible"
 
-    api_key = get("SMI_API_KEY", "OPENAI_API_KEY", "ZAI_API_KEY", "ZHIPUAI_API_KEY")
+    api_key = get_api_key()
     if not api_key:
-        raise ValueError("missing API key (set SMI_API_KEY or OPENAI_API_KEY)")
+        raise ValueError("missing API key (set SMI_API_KEY, OPENROUTER_API_KEY, or OPENAI_API_KEY)")
 
-    base_url = get("SMI_API_BASE_URL", "OPENAI_BASE_URL", "OPENAI_API_BASE") or "https://api.openai.com/v1"
+    base_url = (
+        get("SMI_API_BASE_URL", "OPENROUTER_BASE_URL", "OPENAI_BASE_URL", "OPENAI_API_BASE")
+        or "https://api.openai.com/v1"
+    )
     model = get("SMI_MODEL", "OPENAI_MODEL") or "gpt-4o-mini"
 
     temperature_s = get("SMI_TEMPERATURE") or "0"
@@ -68,25 +115,36 @@ def load_real_agent_config(env_overrides: dict[str, str] | None = None) -> RealA
     thinking_s = get("SMI_THINKING")
     response_format_s = get("SMI_RESPONSE_FORMAT")
     clear_thinking_s = get("SMI_CLEAR_THINKING")
+    min_request_timeout_s = get("SMI_MIN_REQUEST_TIMEOUT_SECONDS", "SMI_MIN_REQUEST_TIMEOUT_S")
+    max_request_retries_s = get("SMI_MAX_REQUEST_RETRIES")
 
     try:
         temperature = float(temperature_s)
-    except Exception as e:
-        raise ValueError(f"invalid SMI_TEMPERATURE={temperature_s}") from e
+        if not (0.0 <= temperature <= 2.0):
+            raise ValueError(f"SMI_TEMPERATURE must be between 0.0 and 2.0, got {temperature}")
+    except (ValueError, TypeError) as e:
+        if isinstance(e, ValueError) and "must be between" in str(e):
+            raise
+        raise ValueError(f"invalid SMI_TEMPERATURE={temperature_s!r} (expected float between 0.0 and 2.0)") from e
 
     max_tokens = None
     if max_tokens_s:
         try:
             val = int(max_tokens_s)
-            if val > 0:
-                max_tokens = val
-        except Exception as e:
-            raise ValueError(f"invalid SMI_MAX_TOKENS={max_tokens_s}") from e
+            if val <= 0:
+                raise ValueError(f"SMI_MAX_TOKENS must be positive, got {val}")
+            if val > 100000:
+                raise ValueError(f"SMI_MAX_TOKENS seems unreasonably large: {val} (max recommended: 100000)")
+            max_tokens = val
+        except (ValueError, TypeError) as e:
+            if isinstance(e, ValueError) and ("must be" in str(e) or "unreasonably" in str(e)):
+                raise
+            raise ValueError(f"invalid SMI_MAX_TOKENS={max_tokens_s!r} (expected positive integer)") from e
 
     try:
         clear_thinking = _parse_bool(clear_thinking_s) if clear_thinking_s else None
-    except Exception as e:
-        raise ValueError(f"invalid SMI_CLEAR_THINKING={clear_thinking_s!r}") from e
+    except ValueError as e:
+        raise ValueError(f"invalid SMI_CLEAR_THINKING={clear_thinking_s!r} (expected 'true', 'false', '1', '0', 'yes', 'no')") from e
 
     return RealAgentConfig(
         provider=provider,
@@ -98,6 +156,8 @@ def load_real_agent_config(env_overrides: dict[str, str] | None = None) -> RealA
         thinking=thinking_s,
         response_format=response_format_s,
         clear_thinking=clear_thinking,
+        min_request_timeout_s=float(min_request_timeout_s) if min_request_timeout_s else None,
+        max_request_retries=int(max_request_retries_s) if max_request_retries_s else None,
     )
 
 
@@ -107,6 +167,9 @@ class RealAgent:
 
     Currently supports OpenAI-compatible chat completions via:
       POST {base_url}/chat/completions
+
+    This includes OpenRouter (unified API for 150+ models), OpenAI, and other
+    OpenAI-compatible providers.
     """
 
     def __init__(self, cfg: RealAgentConfig, client: httpx.Client | None = None) -> None:
@@ -115,6 +178,36 @@ class RealAgent:
 
         if cfg.provider != "openai_compatible":
             raise ValueError(f"unsupported provider: {cfg.provider}")
+
+        # Detect OpenRouter for optimizations
+        self.is_openrouter = "openrouter.ai" in cfg.base_url.lower()
+
+        if self.is_openrouter:
+            self._client.headers.update(self._openrouter_headers())
+
+        # Auto-detect reasoning models that need more tokens
+        self.is_reasoning_model = any(
+            x in cfg.model.lower() for x in ["deepseek", "o1", "o3", "glm", "qwen", "thinking"]
+        )
+
+    def _request_retries(self) -> int:
+        if self.cfg.max_request_retries is None:
+            return 6
+        return max(0, int(self.cfg.max_request_retries))
+
+    def _request_timeout(self, *, remaining_s: float | None) -> float | None:
+        if remaining_s is None:
+            return None
+        timeout = max(1.0, float(remaining_s))
+        if self.cfg.min_request_timeout_s is not None:
+            timeout = max(timeout, float(self.cfg.min_request_timeout_s))
+        return timeout
+
+    def _openrouter_headers(self) -> dict[str, str]:
+        return {
+            "HTTP-Referer": "https://github.com/MystenLabs/sui-move-interface-extractor",
+            "X-Title": "Sui Move Interface Extractor Benchmark",
+        }
 
     def smoke(self) -> set[str]:
         """
@@ -126,9 +219,30 @@ class RealAgent:
         )
         return self.complete_type_list(prompt)
 
-    def complete_type_list(self, prompt: str, *, timeout_s: float | None = None) -> set[str]:
+    def debug_effective_config(self) -> dict[str, str]:
+        def redact(v: str) -> str:
+            suffix = v[-6:] if len(v) >= 6 else v
+            return f"len={len(v)} suffix={suffix}"
+
+        return {
+            "provider": self.cfg.provider,
+            "base_url": self.cfg.base_url,
+            "model": self.cfg.model,
+            "api_key": redact(self.cfg.api_key),
+        }
+
+    def complete_type_list(
+        self,
+        prompt: str,
+        *,
+        timeout_s: float | None = None,
+        logger: object | None = None,
+        log_context: dict[str, object] | None = None,
+    ) -> set[str]:
         url = f"{self.cfg.base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {self.cfg.api_key}"}
+        if self.is_openrouter:
+            headers.update(self._openrouter_headers())
         payload = {
             "model": self.cfg.model,
             "temperature": self.cfg.temperature,
@@ -155,6 +269,8 @@ class RealAgent:
         last_exc: Exception | None = None
         last_status: int | None = None
         last_body_prefix: str | None = None
+        # timeout_s is provided by the runner's per-package time budget. Treat it as the primary limiter.
+        # Do not add extra internal deadlines beyond the per-request timeout we pass to httpx.
         deadline = (time.monotonic() + timeout_s) if timeout_s is not None else None
 
         def body_prefix(r: httpx.Response) -> str:
@@ -181,16 +297,14 @@ class RealAgent:
                         return msg
             return None
 
-        for attempt in range(6):
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("per-call timeout exceeded")
+        for attempt in range(self._request_retries()):
             try:
                 req_timeout = None
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("per-call timeout exceeded")
-                    req_timeout = max(1.0, remaining)
+                    req_timeout = self._request_timeout(remaining_s=remaining)
                 r = self._client.post(url, headers=headers, json=payload, timeout=req_timeout)
                 last_status = r.status_code
                 last_body_prefix = body_prefix(r)
@@ -238,6 +352,23 @@ class RealAgent:
                 break
             except Exception as e:
                 last_exc = e
+                if logger is not None:
+                    ctx = dict(log_context or {})
+                    ctx.update(
+                        {
+                            "attempt": attempt + 1,
+                            "endpoint": url,
+                            "model": self.cfg.model,
+                            "base_url": self.cfg.base_url,
+                            "timeout_s": timeout_s,
+                            "req_timeout_s": req_timeout,
+                            "last_status": last_status,
+                            "last_body_prefix": last_body_prefix,
+                            "exc_type": type(e).__name__,
+                            "exc": str(e),
+                        }
+                    )
+                    logger.event("llm_request_error", **ctx)
                 sleep_s = backoff_s
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
@@ -279,7 +410,14 @@ class RealAgent:
 
         return extract_type_list(content)
 
-    def complete_json(self, prompt: str, *, timeout_s: float | None = None) -> dict:
+    def complete_json(
+        self,
+        prompt: str,
+        *,
+        timeout_s: float | None = None,
+        logger: object | None = None,
+        log_context: dict[str, object] | None = None,
+    ) -> dict:
         """
         Request an OpenAI-compatible chat completion and parse the assistant content as a JSON object.
 
@@ -287,6 +425,8 @@ class RealAgent:
         """
         url = f"{self.cfg.base_url}/chat/completions"
         headers = {"Authorization": f"Bearer {self.cfg.api_key}"}
+        if self.is_openrouter:
+            headers.update(self._openrouter_headers())
         payload = {
             "model": self.cfg.model,
             "temperature": self.cfg.temperature,
@@ -313,6 +453,8 @@ class RealAgent:
         last_exc: Exception | None = None
         last_status: int | None = None
         last_body_prefix: str | None = None
+        # timeout_s is provided by the runner's per-package time budget. Treat it as the primary limiter.
+        # Do not add extra internal deadlines beyond the per-request timeout we pass to httpx.
         deadline = (time.monotonic() + timeout_s) if timeout_s is not None else None
 
         def body_prefix(r: httpx.Response) -> str:
@@ -339,16 +481,14 @@ class RealAgent:
                         return msg
             return None
 
-        for _attempt in range(6):
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError("per-call timeout exceeded")
+        for _attempt in range(self._request_retries()):
             try:
                 req_timeout = None
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("per-call timeout exceeded")
-                    req_timeout = max(1.0, remaining)
+                    req_timeout = self._request_timeout(remaining_s=remaining)
                 r = self._client.post(url, headers=headers, json=payload, timeout=req_timeout)
                 last_status = r.status_code
                 last_body_prefix = body_prefix(r)
@@ -396,6 +536,23 @@ class RealAgent:
                 break
             except Exception as e:
                 last_exc = e
+                if logger is not None:
+                    ctx = dict(log_context or {})
+                    ctx.update(
+                        {
+                            "attempt": _attempt + 1,
+                            "endpoint": url,
+                            "model": self.cfg.model,
+                            "base_url": self.cfg.base_url,
+                            "timeout_s": timeout_s,
+                            "req_timeout_s": req_timeout,
+                            "last_status": last_status,
+                            "last_body_prefix": last_body_prefix,
+                            "exc_type": type(e).__name__,
+                            "exc": str(e),
+                        }
+                    )
+                    logger.event("llm_request_error", **ctx)
                 sleep_s = backoff_s
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
@@ -421,17 +578,64 @@ class RealAgent:
             except Exception as e:
                 raise ValueError(f"unexpected response shape: {data}") from e
 
+        if logger is not None:
+            ctx = dict(log_context or {})
+            ctx.update(
+                {
+                    "endpoint": url,
+                    "model": self.cfg.model,
+                    "base_url": self.cfg.base_url,
+                    "timeout_s": timeout_s,
+                    "content": content,
+                }
+            )
+            logger.event("llm_response", **ctx)
+
         if not isinstance(content, str):
             raise ValueError("unexpected response content type")
         if content.strip() == "":
-            raise ValueError(f"model returned empty content. full_response={data}")
+            finish_reason = None
+            try:
+                finish_reason = data["choices"][0].get("finish_reason")
+            except Exception:
+                pass
+            hint = ""
+            if finish_reason == "length":
+                hint = " (model hit max_tokens; increase SMI_MAX_TOKENS or reduce prompt size)"
+            raise ValueError(f"model returned empty content{hint}")
 
         try:
-            parsed = extract_json_value(content)
+            parsed = json.loads(content)
         except Exception as e:
-            raise ValueError(f"model output was not valid JSON: {content[:300]!r}") from e
+            if logger is not None:
+                ctx = dict(log_context or {})
+                ctx.update(
+                    {
+                        "endpoint": url,
+                        "model": self.cfg.model,
+                        "base_url": self.cfg.base_url,
+                        "timeout_s": timeout_s,
+                        "exc_type": type(e).__name__,
+                        "exc": str(e),
+                        "content": content,
+                    }
+                )
+                logger.event("llm_json_parse_error", **ctx)
+            raise
+
+        if logger is not None:
+            ctx = dict(log_context or {})
+            ctx.update(
+                {
+                    "endpoint": url,
+                    "model": self.cfg.model,
+                    "base_url": self.cfg.base_url,
+                    "timeout_s": timeout_s,
+                    "parsed": parsed,
+                }
+            )
+            logger.event("llm_json_parsed", **ctx)
 
         if not isinstance(parsed, dict):
-            raise ValueError(f"model output must be a JSON object, got {type(parsed)}")
-
+            raise ValueError("expected a JSON object")
         return parsed

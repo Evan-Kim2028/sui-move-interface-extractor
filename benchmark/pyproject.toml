@@ -5,6 +5,7 @@ description = "Benchmark harness for sui-move-interface-extractor (key-struct ta
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "agentbeats>=1.2.6",
     "httpx>=0.27.0",
     "rich>=14.2.0",
 ]
@@ -14,6 +15,15 @@ smi-bench = "smi_bench.cli:main"
 smi-phase1 = "smi_bench.runner:main"
 smi-inhabit = "smi_bench.inhabit_runner:main"
 smi-phase2-manifest = "smi_bench.inhabit_manifest:main"
+smi-a2a-green = "smi_bench.a2a_green_agent:main"
+smi-a2a-purple = "smi_bench.a2a_purple_agent:main"
+smi-agentbeats-scenario = "smi_bench.agentbeats_run_scenario:main"
+smi-a2a-smoke = "smi_bench.a2a_smoke:main"
+smi-a2a-validate-bundle = "smi_bench.a2a_validate_bundle:main"
+smi-a2a-preflight = "smi_bench.a2a_preflight:main"
+smi-phase2-filter-manifest = "smi_bench.manifest_filter:main"
+smi-phase2-targeted-run = "smi_bench.phase2_targeted_run:main"
+smi-openrouter-models = "smi_bench.openrouter_models:main"
 
 [dependency-groups]
 dev = [

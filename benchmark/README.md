@@ -1,414 +1,339 @@
 ## `benchmark/` (benchmarks)
 
-This folder contains two benchmarks:
+This directory contains the A2A benchmarking harness.
 
-- **Phase I (key-struct discovery)**: ask an LLM to predict which structs have `key`.
-- **Phase II (type inhabitation)**: build a PTB plan, dry-run (ground truth) or dev-inspect (fallback), and score created key types.
+- **Phase I (key-struct discovery):** ask a model to predict which structs have `key`.
+- **Phase II (type inhabitation):** have a model produce a PTB plan, simulate it (dry-run/dev-inspect), and score created key types.
 
-It uses `sui-move-interface-extractor` as the ground-truth parser for `.mv` bytecode artifacts.
+> Start here: [QUICKSTART.md](./QUICKSTART.md)
 
-## AgentBeats / Berkeley “Green Agent”
+If you're using the local A2A/AgentBeats flow, start here instead: [A2A_GETTING_STARTED.md](./A2A_GETTING_STARTED.md)
 
-This benchmark suite is intended to plug into AgentBeats-style evaluation (Berkeley RDI AgentX):
+## Phase I caveat (partial information)
 
-https://rdi.berkeley.edu/agentx-agentbeats
+Phase I is intentionally designed to avoid trivial leakage:
 
-Phase I already has:
+- The benchmark computes ground-truth key structs from bytecode-derived interfaces (which include `abilities`).
+- The model prompt **omits `abilities`** and shows only a bounded subset of struct shapes (fields + types).
 
-- deterministic targets (bytecode-derived `key` structs)
-- mechanical scoring (precision/recall/F1)
-- resumable batch execution over a corpus
+This means Phase I scores reflect performance under **partial information** (and can be affected by prompt truncation).
+When reporting Phase I results, always record the effective `--max-structs-in-prompt` used.
 
-Phase II simulates the model’s PTB plan and scores it by created object types:
+### Phase I scoring + output format (important)
 
-- Ground truth mode: `--require-dry-run` with a funded sender (dry-run returns `objectChanges.objectType`)
-- Best-effort mode: omit `--require-dry-run` and fall back to dev-inspect + bytecode proxy scoring
+Phase I is scored as set matching between:
 
-Phase II also supports bounded, deterministic “local adaptation” without an LLM reprompt:
+- **truth**: all `key` structs in the package (derived from bytecode interface JSON), and
+- **predicted**: the model’s `key_types` list.
 
-- Gas retry ladder on `InsufficientGas`: `--gas-budget-ladder`
-- Heuristic PTB plan variants (e.g., replace placeholder addresses with `--sender`, try small integer literals): `--max-heuristic-variants`
+Metrics: **precision / recall / F1** over predicted type strings.
 
-For Phase II dry-run, set a sender with gas in `benchmark/.env` (or pass flags explicitly):
+Output requirements:
 
-- `SMI_SENDER=0x...` (address with at least one `Coin<SUI>` on that network)
-- `SMI_GAS_COIN=0x...` (optional; pins a specific gas coin object id)
+- The model must return **only valid JSON** with a single key: `{"key_types": ["0xADDR::module::Struct", ...]}`.
+- Addresses should be **canonical** (32-byte / 64 hex chars) to avoid superficial mismatches (e.g., prefer `0x000...0002` over `0x2`).
 
-### Setup
+## One-time Setup
 
 ```bash
 cd benchmark
 uv sync --group dev --frozen
+
+# Build Rust helpers used by Phase II
+cd .. && cargo build --release --locked && cd benchmark
 ```
 
-If `uv` is unavailable in your environment, you can still run the tools with:
+## Corpus
 
-- `PYTHONPATH=src python3 -m pytest`
-- `PYTHONPATH=src python3 -m smi_bench.inhabit_runner --help`
-- `PYTHONPATH=src python3 -m smi_bench.inhabit_manifest --help`
+You need a local checkout of the `sui-packages` bytecode corpus and should point benchmarks at:
+`<sui-packages-checkout>/packages/mainnet_most_used`.
 
-Build the Rust binaries used by the benchmarks:
+## Configure a Model
 
-```bash
-cd ..
-cargo build --release --locked
-cd benchmark
-```
-
-### Dataset
-
-You need a local checkout of the Sui bytecode corpus:
-
-```bash
-# Shallow clone is sufficient and faster
-git clone --depth 1 https://github.com/MystenLabs/sui-packages.git
-```
-
-Benchmarks typically target the `mainnet_most_used` subset: `sui-packages/packages/mainnet_most_used`.
-
-### Standard Benchmarks
-
-We provide canonical benchmark manifests in `benchmark/manifests/` to ensure consistent evaluation.
-
-**Phase II Standard Set (n=292):** `benchmark/manifests/standard_phase2_benchmark.txt`
-
-- **Why this list?** The full corpus (~1000 packages) is mostly non-viable for simple transaction simulation (requiring complex admin caps or specific setups).
-- **Origin:** This subset contains ~292 packages from `mainnet_most_used` that have been verified to expose at least one "inhabitable" public entry function compatible with the harness.
-- **Usage:** Always use this list for Phase II leaderboard runs to avoid 98% rejection rates.
-
-### Configure a real agent (optional)
-
-Copy `benchmark/.env.example` to `benchmark/.env` and fill in:
-
+Copy `benchmark/.env.example` to `benchmark/.env` and set:
 - `SMI_API_KEY`
+- `SMI_API_BASE_URL`
 - `SMI_MODEL`
-- `SMI_API_BASE_URL` (OpenAI-compatible base; for non-OpenAI providers)
+- `SMI_SENDER` (funded address for mainnet dry-run)
 
-Z.AI GLM-4.7 example:
-
+Sanity checks:
 ```bash
-cp .env.example .env
-# set:
-# If you’re on the GLM Coding Plan, use:
-# SMI_API_BASE_URL=https://api.z.ai/api/coding/paas/v4
-# (If you’re on Model API instead, use https://api.z.ai/api/paas/v4)
-# SMI_MODEL=glm-4.7
-# SMI_THINKING=enabled
-# SMI_CLEAR_THINKING=true
-# SMI_RESPONSE_FORMAT=json_object
-# SMI_MAX_TOKENS=2048
+uv run smi-phase1 --corpus-root <CORPUS_ROOT> --doctor-agent --agent real-openai-compatible
 ```
 
-Smoke test (does a single tiny API call and expects `{ "key_types": [] }` JSON):
+## Run Benchmarks
+
+### Quick Start (Recommended Path)
+
+1) One-time setup:
 
 ```bash
-uv run smi-bench --corpus-root <sui-packages-checkout>/packages/mainnet_most_used --smoke-agent --agent real-openai-compatible
+cd benchmark
+uv sync --group dev --frozen
+
+cd .. && cargo build --release --locked && cd benchmark
 ```
 
-Diagnostics (prints redacted config and probes `GET /models` + `POST /chat/completions`):
+2) Configure credentials:
 
-```bash
-uv run smi-bench --corpus-root <sui-packages-checkout>/packages/mainnet_most_used --doctor-agent --agent real-openai-compatible
-```
+- Copy `benchmark/.env.example` to `benchmark/.env`.
+- Set `SMI_API_KEY`, `SMI_API_BASE_URL`, `SMI_MODEL`.
 
-### Run (Unified Workflow)
-
-The simplest way to benchmark an agent (or the baseline) is the `run-all` command, which executes Phase I and Phase II sequentially.
-
-```bash
-uv run smi-bench run-all \
-  --corpus-root <sui-packages-checkout>/packages/mainnet_most_used \
-  --out-dir results/my_run_01 \
-  --samples 100 \
-  --sender <FUNDED_MAINNET_ADDRESS> \
-  --rpc-url https://fullnode.mainnet.sui.io:443
-```
-
-This will:
-1.  **Phase I**: Run Key Struct Discovery (static analysis).
-2.  **Phase II Manifest**: Select viable candidates from the Phase I corpus.
-3.  **Phase II Execution**: Attempt to execute transactions (using `dry-run` if sender is provided, else `build-only`).
-
-Artifacts will be saved in `results/my_run_01/`.
-
-### Run Phase II (Standard Benchmark)
-
-To run the standard Phase II benchmark against the canonical 292 viable packages:
+3) Run a small sample (fast feedback):
 
 ```bash
 uv run smi-inhabit \
-  --corpus-root <sui-packages-checkout>/packages/mainnet_most_used \
-  --package-ids-file manifests/standard_phase2_benchmark.txt \
+  --corpus-root <CORPUS_ROOT> \
+  --package-ids-file manifests/standard_phase2_no_framework.txt \
+  --samples 10 \
   --agent real-openai-compatible \
-  --out results/phase2_standard_run.json \
   --rpc-url https://fullnode.mainnet.sui.io:443 \
-  --continue-on-error
+  --simulation-mode dry-run \
+  --continue-on-error \
+  --checkpoint-every 1 \
+  --per-package-timeout-seconds 90 \
+  --max-plan-attempts 2 \
+  --out results/phase2_sample10.json
 ```
 
-### Run (Legacy / Modular)
+#### “Official” run recommendations (Phase II)
 
-You can still run individual tools for debugging or advanced use cases.
+- Prefer strict dry-run-only evaluation: use `--simulation-mode dry-run --require-dry-run`.
+- Use a consistent funded sender (`SMI_SENDER`) to reduce variance from inventory-dependent calls.
 
-**Phase I only:**
+4) Run a full benchmark:
+
+```bash
+uv run smi-inhabit \
+  --corpus-root <CORPUS_ROOT> \
+  --package-ids-file manifests/standard_phase2_no_framework.txt \
+  --agent real-openai-compatible \
+  --rpc-url https://fullnode.mainnet.sui.io:443 \
+  --simulation-mode dry-run \
+  --continue-on-error \
+  --checkpoint-every 1 \
+  --per-package-timeout-seconds 90 \
+  --max-plan-attempts 2 \
+  --out results/phase2_full_run.json \
+  --resume
+```
+
+### Phase II (Standard / Leaderboard)
+
+Use the canonical Phase II set:
+- `manifests/standard_phase2_benchmark.txt` (n=292; includes framework packages)
+- `manifests/standard_phase2_no_framework.txt` (n=290; excludes slow `0x2` and `0x3`)
+
+```bash
+uv run smi-inhabit \
+  --corpus-root <CORPUS_ROOT> \
+  --package-ids-file manifests/standard_phase2_no_framework.txt \
+  --agent real-openai-compatible \
+  --rpc-url https://fullnode.mainnet.sui.io:443 \
+  --simulation-mode dry-run \
+  --continue-on-error \
+  --max-plan-attempts 2 \
+  --per-package-timeout-seconds 300 \
+  --out results/phase2_run.json \
+  --resume
+```
+
+### Phase II Flags Reference
+
+Common knobs:
+
+- `--corpus-root`: bytecode corpus root (typically `.../sui-packages/packages/mainnet_most_used`).
+- `--package-ids-file`: manifest file (one package id per line; comments allowed). Default: unset.
+- `--samples`: limit how many package ids to run. Default: `100` (or if using a manifest, takes the first N in order).
+- `--seed`: sampling seed. Default: `0`.
+- `--agent`: which strategy to use. Default: `real-openai-compatible`.
+- `--rpc-url`: Sui fullnode RPC for simulation. Default: `https://fullnode.mainnet.sui.io:443`.
+- `--sender`: sender address for tx simulation. Default: `SMI_SENDER` from `--env-file`, otherwise `0x0`.
+- `--simulation-mode`: tx simulation mode. Default: `dry-run` (options: `dry-run`, `dev-inspect`, `build-only`).
+- `--continue-on-error`: keep going even if some packages fail. Default: off.
+- `--max-plan-attempts`: max replanning attempts per package (real agent only). Default: `2`.
+- `--max-planning-calls`: max LLM planning calls per package (progressive exposure). Default: `2`.
+- `--max-heuristic-variants`: max deterministic PTB variants to try per plan attempt. Default: `4`.
+- `--baseline-max-candidates`: max candidates per package in `baseline-search`. Default: `20`.
+- `--gas-budget`: gas budget for dry-run simulation. Default: `10000000`.
+- `--gas-budget-ladder`: retry budgets for `InsufficientGas`. Default: `20000000,50000000`.
+- `--gas-coin`: optional gas coin object id. Default: unset (auto-picks first Coin<SUI> for sender).
+- `--per-package-timeout-seconds`: wall-clock budget per package (planning + simulation). Default: `120`.
+- `--checkpoint-every`: write partial results to `--out` every N packages. Default: `0` (disabled).
+- `--out`: output JSON file. Default: unset.
+- `--resume`: resume from an existing `--out`. Default: off.
+- `--env-file`: dotenv file. Default: `.env` in current working directory.
+- `--log-dir`: JSONL log directory. Default: `benchmark/logs` (use `--no-log` to disable).
+
+### Phase I
+
 ```bash
 uv run smi-phase1 \
-  --corpus-root ... \
-  --samples 25 \
-  --agent mock-empty \
-  --out results/phase1.json
+  --corpus-root <CORPUS_ROOT> \
+  --agent real-openai-compatible \
+  --out results/phase1_run.json \
+  --resume
 ```
 
-**Phase II only:**
+## Interpret Results (Phase II)
+
+Given `results/phase2_run.json` and a `package_id`:
+
+1) **Targets / score**
 ```bash
-# 1. Generate Manifest
-uv run smi-phase2-manifest \
-  --corpus-root ... \
-  --out-ids results/p2_ids.txt \
-  --out-plan results/p2_plan.json \
-  --out-report results/p2_report.json
-
-# 2. Run Execution
-uv run smi-inhabit \
-  --corpus-root ... \
-  --package-ids-file results/p2_ids.txt \
-  --agent baseline-search \
-  --simulation-mode dry-run \
-  --out results/p2_exec.json
+python scripts/phase2_analyze.py results/phase2_run.json --show <package_id>
 ```
 
-### Output
-
-The runner writes a JSON report with:
-
-- `aggregate`: average precision/recall/F1 and error count
-- `packages[]`: per-package scores and telemetry (`elapsed_seconds`, `timed_out`, etc.)
-
-Use:
-
+2) **Progress + timing**
 ```bash
-python scripts/phase1_status.py results/<file>.json
-python scripts/phase1_analyze.py --run-json results/<file>.json
-python scripts/phase1_analyze.py --run-json results/<file>.json --show <package_id>
+python scripts/phase2_status.py results/phase2_run.json
+python scripts/phase2_metrics.py results/phase2_run.json
 ```
 
-### Phase I methodology (key-struct discovery)
-
-- Treat bytecode-derived `abilities` as ground truth.
-- Hide `abilities` from the model prompt to avoid trivial extraction.
-- Ask the model to output `{"key_types":[...]}`
-- Score predictions against truth using precision/recall/F1.
-- Expect timeouts and partial progress on large packages; the runner records `timed_out` and `error` per package and supports resume.
-
-### Running 500 packages (first half) in batches of 5
-
-Generate deterministic manifests (first 500 ids + remaining ids) from your local corpus:
-
-```bash
-uv run python scripts/make_mainnet_most_used_halves.py \
-  --corpus-root <sui-packages-checkout>/packages/mainnet_most_used
-```
-
-Run Phase I for the first 500 ids in sequential 5-package batches (2-minute per-package timeout, resume-safe):
-
-```bash
-./scripts/run_phase1_manifest_batches.sh \
-  <sui-packages-checkout>/packages/mainnet_most_used \
-  results/manifests/mainnet_most_used_first500_ids.txt \
-  results/phase1_first500_glm47.json
-```
-
-Check what is done vs remaining:
-
-```bash
-python scripts/manifest_remaining.py \
-  --manifest results/manifests/mainnet_most_used_first500_ids.txt \
-  --out-json results/phase1_first500_glm47.json
-```
-
-Later, run the remaining 500 ids by swapping the manifest:
-
-```bash
-./scripts/run_phase1_manifest_batches.sh \
-  <sui-packages-checkout>/packages/mainnet_most_used \
-  results/manifests/mainnet_most_used_remaining500_ids.txt \
-  results/phase1_remaining500_glm47.json
-```
-
-### Phase II scaffold (type inhabitation)
-
-`smi-inhabit` is the Phase II runner for the “PTB type inhabitation” benchmark (build PTB → dry-run/dev-inspect → score by created key types).
-
-It runs transaction simulation via the Rust helper binary `smi_tx_sim`.
-
-Phase II prefers **dry-run** to get transaction-ground-truth created object types from `objectChanges.objectType`.
-
-If dry-run cannot run (most commonly because the sender has no gas coin on the target network), it can fall back to dev-inspect + a
-bytecode-first proxy: scan called function bytecode for `0x2::transfer::transfer<T>` / `public_transfer<T>` / `share_object<T>` and treat those `T` as “created types”.
-
-Offline sanity (no RPC): `smi_tx_sim --mode build-only` validates the PTB spec and emits `programmableTransactionBcsBase64`.
-
-#### PTB spec schema (minimal)
-
-The PTB spec is JSON:
-
-- `{"calls":[{"target":"0xADDR::module::function","type_args":[...],"args":[...]}]}`
-
-Supported `args` entries:
-
-- Pure values:
-  - `{"u8": 1}`, `{"u16": 1}`, `{"u32": 1}`, `{"u64": 1}`, `{"bool": true}`
-  - `{"address": "0x..."}`
-  - `{"vector_u8_utf8": "text"}`, `{"vector_u8_hex": "0xdeadbeef"}`
-  - `{"vector_address": ["0x1","0x2"]}`
-  - `{"vector_bool": [true,false]}`, `{"vector_u16": [1,2]}`, `{"vector_u32": [1,2]}`, `{"vector_u64": [1,2]}`
-- Object values (resolved via RPC):
-  - `{"imm_or_owned_object": "0x<OBJECT_ID>"}`
-  - `{"shared_object": {"id":"0x<OBJECT_ID>","mutable": true}}`
-
-Supported system objects:
-- `0x6::clock::Clock` (shared, 0x6)
-- `0x8::random::Random` (shared, 0x8)
-- `0x403::deny_list::DenyList` (shared, 0x403)
-
-#### Executable subset policy (Phase II)
-
-Most mainnet packages cannot be executed by an arbitrary sender (they require caps, shared objects, or specific state).
-
-Phase II therefore records per-package failures and supports two modes:
-
-- Ground truth mode: `--require-dry-run` (needs a funded sender on the target network)
-- Best-effort mode: omit `--require-dry-run` (falls back to proxy scoring)
-
-Phase II output includes per-package robustness flags:
-
-- `ptb_parse_ok`: PTB spec was present and parseable
-- `tx_build_ok`: tx simulation helper ran successfully
-- `dry_run_ok`: dry-run succeeded (ground truth)
-- `dev_inspect_ok`: dev-inspect fallback succeeded
-- `dry_run_error`: captured dry-run failure reason (when falling back)
-
-#### Generating a Viability Report
-
-To see *why* packages are rejected (e.g., "has type params", "needs unsupported object"), run the manifest generator with a report path:
-
-```bash
-uv run smi-phase2-manifest \
-  --corpus-root ../sui-packages/packages/mainnet_most_used \
-  --out-ids results/manifests/phase2_ids.txt \
-  --out-plan results/manifests/phase2_plan.json \
-  --out-report results/manifests/phase2_viability_report.json
-```
-
-The report JSON contains detailed rejection statistics under `stats.rejection_reasons_counts` and sample failures in `rejected_samples`.
-
-#### Running the Baseline Search
-
-To establish a deterministic performance floor, run the `baseline-search` agent. It exhaustively tries all "runnable" candidate functions found by the analysis logic.
-
-```bash
-uv run smi-inhabit \
-  --corpus-root ../sui-packages/packages/mainnet_most_used \
-  --package-ids-file results/manifests/phase2_ids.txt \
-  --samples 25 --seed 0 \
-  --agent baseline-search \
-  --baseline-max-candidates 50 \
-  --rpc-url https://fullnode.mainnet.sui.io:443 \
-  --sender <FUNDED_MAINNET_ADDRESS> \
-  --simulation-mode dry-run \
-  --out results/phase2_baseline.json
-```
-
-```bash
-uv run smi-phase2-manifest \
-  --corpus-root <sui-packages-checkout>/packages/mainnet_most_used \
-  --out-ids results/manifests/phase2_executable_ids.txt \
-  --out-plan results/manifests/phase2_executable_plans.json \
-  --out-report results/manifests/phase2_executable_report.json
-
-uv run smi-inhabit \
-  --corpus-root <sui-packages-checkout>/packages/mainnet_most_used \
-  --package-ids-file results/manifests/phase2_executable_ids.txt \
-  --samples 25 --seed 0 \
-  --agent mock-planfile \
-  --plan-file results/manifests/phase2_executable_plans.json \
-  --rpc-url https://fullnode.mainnet.sui.io:443 \
-  --sender <FUNDED_MAINNET_ADDRESS> \
-  --gas-budget 10000000 \
-  --gas-budget-ladder 20000000,50000000 \
-  --gas-coin <OPTIONAL_GAS_COIN_OBJECT_ID> \
-  --simulation-mode dry-run \
-  --max-plan-attempts 2 \
-  --include-created-types \
-  --continue-on-error \
-  --per-package-timeout-seconds 120 \
-  --require-dry-run \
-  --out results/phase2_two_packages.json
-```
-
-Notes:
-
-- When `--package-ids-file` is set, Phase II treats `--samples` as a batch size over the manifest order (works with `--resume`).
-- `--gas-coin` is optional; if omitted, `smi_tx_sim` picks the first `Coin<SUI>` found for `--sender`.
-- For local-only scaffolding runs, use `--simulation-mode build-only` (no RPC).
-
-Quick status / per-package analysis:
-
-```bash
-python scripts/phase2_status.py results/phase2_two_packages.json
-python scripts/phase2_analyze.py results/phase2_two_packages.json
-python scripts/phase2_analyze.py results/phase2_two_packages.json --show <package_id>
-python scripts/phase2_metrics.py results/phase2_two_packages.json
-```
-
-Compare multiple Phase II runs (leaderboard):
-
-```bash
-python scripts/phase2_leaderboard.py results/phase2_run_a.json results/phase2_run_b.json
-```
-
-### Dev workflow
-
-```bash
-./scripts/lint.sh
-```
-
-### Logs (JSONL)
-
-Both Phase I and Phase II can write a per-run log directory under `benchmark/logs/` containing:
-
-- `run_metadata.json`
-- `events.jsonl` (progress + timings)
-- `packages.jsonl` (one row per package)
-
-Disable logging with `--no-log`, or set a custom location with `--log-dir`.
-
-Tail events while a run is executing:
-
+3) **Live logs** (if you ran with logging enabled)
 ```bash
 python scripts/tail_events.py logs/<run_id>/events.jsonl --follow
 ```
 
-If a run is interrupted, you can compute remaining manifest ids from `packages.jsonl`:
+4) **Which tier failed?**
+- Planning: `error` (e.g. `per-call timeout exceeded`, JSON schema errors)
+- Build: `tx_build_ok`
+- Execution: `dry_run_ok` / `dry_run_error` (and `dev_inspect_ok` if fallback enabled)
+- Score: `score.created_hits / score.targets`
+
+### Debug One Package
+
+To reproduce a single `package_id` deterministically, create a one-line manifest and run Phase II on just that package:
 
 ```bash
-python scripts/manifest_remaining_from_jsonl.py \
-  --manifest results/manifests/mainnet_most_used_first500_ids.txt \
-  --packages-jsonl logs/<run_id>/packages.jsonl
+printf "%s\n" <package_id> > results/debug_one_pkg.txt
+
+uv run smi-inhabit \
+  --corpus-root <CORPUS_ROOT> \
+  --package-ids-file results/debug_one_pkg.txt \
+  --agent real-openai-compatible \
+  --rpc-url https://fullnode.mainnet.sui.io:443 \
+  --simulation-mode dry-run \
+  --continue-on-error \
+  --max-plan-attempts 2 \
+  --per-package-timeout-seconds 300 \
+  --checkpoint-every 1 \
+  --out results/debug_one_pkg.json
+
+python scripts/phase2_analyze.py results/debug_one_pkg.json --show <package_id>
 ```
 
-### Phase II “harder tier”
-
-The default Phase II manifest is intentionally conservative (single-call, auto-filled args).
-You can generate a slightly harder manifest that also allows common system inputs like:
-
-- `&Clock` (shared object `0x6`)
-- `Coin<SUI>` (select a non-gas `Coin<SUI>` owned by `--sender`)
+If you want identical logging/layout across reruns, pass a fixed `--run-id` and follow logs:
 
 ```bash
-cd ..
-PYTHONPATH=benchmark/src python3 -m smi_bench.inhabit_manifest \
-  --corpus-root ../sui-package-benchmark/.local/research/sui-packages/packages/mainnet_most_used \
-  --out-ids benchmark/results/manifests/phase2_executable_ids_n1000_harder_v1.txt \
-  --out-plan benchmark/results/manifests/phase2_executable_plans_n1000_harder_v1.json \
-  --out-report benchmark/results/manifests/phase2_executable_report_n1000_harder_v1.json
+uv run smi-inhabit ... --run-id debug_<package_id>
+python scripts/tail_events.py logs/debug_<package_id>/events.jsonl --follow
+```
+
+## Phase II Scoring (TL;DR)
+
+| Metric | Meaning |
+|--------|---------|
+| `score.targets` | count of `struct ... has key` in the package |
+| `score.created_hits` | how many of those targets were created |
+| per-package `hit_rate` | `created_hits / targets` |
+| `aggregate.avg_hit_rate` | average of per-package hit_rate |
+
+Baseline floor: `baselines/v0.2.2_baseline/` achieves ~**2.6% avg hit rate**.
+
+## Troubleshooting
+
+- **Stuck on `0x2` / `0x3`:** use `manifests/standard_phase2_no_framework.txt`.
+- **Many `per-call timeout exceeded`:** increase `--per-package-timeout-seconds` or disable thinking.
+- **`A move object is expected, instead a move package is passed: 0x1`:** the plan used a package id where an object id was required; this is a planning error and should be captured under `dry_run_error`.
+
+### Timeout Policy
+
+Phase II uses a **per-package wall-clock budget** (`--per-package-timeout-seconds`) that covers:
+- model planning calls (including retries up to `--max-plan-attempts`), and
+- transaction simulation (`smi_tx_sim`).
+
+If planning takes most of the budget, you may see `sim_attempts: 0` and `error: per-call timeout exceeded`.
+
+Practical guidance:
+- For fast feedback loops: lower `--per-package-timeout-seconds` and/or disable thinking.
+- For “heavy thinking” runs: increase `--per-package-timeout-seconds` so at least one plan attempt plus one simulation attempt can complete.
+
+## Deep Docs
+
+- Methodology: `docs/METHODOLOGY.md`
+- Schema: `docs/SCHEMA.md`
+- Operations / runbook: `docs/RUNBOOK.md`
+- Standard manifests: `manifests/README.md`
+
+## AgentBeats / A2A (Local Scenario)
+
+To launch the repo's A2A servers (green + purple) via AgentBeats' `ScenarioManager`:
+
+```bash
+cd benchmark
+uv run smi-agentbeats-scenario scenario_smi --launch-mode current
+```
+
+This starts:
+- green: `smi-a2a-green` on `http://127.0.0.1:9999/`
+- purple: `smi-a2a-purple` on `http://127.0.0.1:9998/`
+
+Health checks:
+```bash
+curl http://127.0.0.1:9999/.well-known/agent-card.json
+curl http://127.0.0.1:9998/.well-known/agent-card.json
+```
+
+### Targets-Only Partial Runs (Skip packages with trivial targets)
+
+If you want to focus Phase II effort on packages with `score.targets >= 2`:
+
+One-command wrapper:
+
+```bash
+uv run smi-phase2-targeted-run \
+  --corpus-root <CORPUS_ROOT> \
+  --min-targets 2 \
+  --scan-samples 500 \
+  --run-samples 50 \
+  --per-package-timeout-seconds 90
+```
+
+1) Scan a slice in `build-only` mode (no LLM calls) to compute `score.targets`:
+
+```bash
+uv run smi-inhabit \
+  --corpus-root <CORPUS_ROOT> \
+  --package-ids-file manifests/standard_phase2_no_framework.txt \
+  --samples 200 \
+  --agent baseline-search \
+  --simulation-mode build-only \
+  --continue-on-error \
+  --out results/phase2_targets_scan.json
+```
+
+2) Filter that output into a manifest:
+
+```bash
+uv run smi-phase2-filter-manifest results/phase2_targets_scan.json \
+  --min-targets 2 \
+  --out-manifest results/manifest_targets_ge2.txt
+```
+
+3) Run a real-agent partial run on that filtered manifest:
+
+```bash
+uv run smi-inhabit \
+  --corpus-root <CORPUS_ROOT> \
+  --package-ids-file results/manifest_targets_ge2.txt \
+  --samples 25 \
+  --agent real-openai-compatible \
+  --simulation-mode dry-run \
+  --continue-on-error \
+  --checkpoint-every 1 \
+  --per-package-timeout-seconds 90 \
+  --max-plan-attempts 2 \
+  --out results/phase2_partial_targets_ge2_25.json \
+  --resume
 ```

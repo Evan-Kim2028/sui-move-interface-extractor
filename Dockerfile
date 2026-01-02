@@ -37,4 +37,4 @@ RUN cd /app/benchmark && uv sync --frozen --no-dev
 
 ENV PATH="/app/benchmark/.venv/bin:${PATH}"
 
-CMD ["sui_move_interface_extractor", "--help"]
+ENTRYPOINT ["smi-a2a-green"]

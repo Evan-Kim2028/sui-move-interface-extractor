@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from smi_bench.utils import safe_json_loads
+
 
 @dataclass(frozen=True)
 class PackageRef:
@@ -25,8 +27,8 @@ def read_package_id_from_metadata(package_dir: Path) -> str | None:
     if not metadata_path.exists():
         return None
     try:
-        data = json.loads(metadata_path.read_text())
-    except Exception:
+        data = safe_json_loads(metadata_path.read_text(), context=f"metadata file {metadata_path}")
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
         return None
     package_id = data.get("id")
     return package_id if isinstance(package_id, str) and package_id else None

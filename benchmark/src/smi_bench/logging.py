@@ -58,6 +58,15 @@ class JsonlLogger:
         self.paths.run_metadata.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n")
 
     def event(self, name: str, **fields: object) -> None:
+        """
+        Log an event with consistent schema.
+
+        All events include:
+        - `t`: Unix timestamp (seconds)
+        - `event`: Event name (string)
+
+        Additional fields are included as provided.
+        """
         row = {"t": _now_unix(), "event": name, **fields}
         with self.paths.events.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, sort_keys=True) + "\n")

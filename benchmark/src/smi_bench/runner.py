@@ -1,5 +1,21 @@
 from __future__ import annotations
 
+"""
+Phase I benchmark runner (key-struct discovery).
+
+Data flow (per package):
+1) Load a local bytecode package dir from a sui-packages-style corpus.
+2) Call the Rust extractor to emit bytecode-derived interface JSON to stdout.
+3) Compute ground truth key types from the interface JSON (`abilities` contains "key").
+4) Build an LLM prompt that intentionally omits `abilities` (to avoid trivial leakage) and may
+   truncate struct context (bounded by --max-structs-in-prompt).
+5) Score predictions via deterministic set matching (precision/recall/F1).
+
+Maintainability notes:
+- Keep output schema stable (see RunResult.schema_version).
+- If you change prompt shaping (e.g., max structs), document it with results; it affects difficulty.
+"""
+
 import argparse
 import json
 import os
@@ -7,6 +23,7 @@ import subprocess
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import httpx
 from rich.console import Console
@@ -18,35 +35,16 @@ from smi_bench.dataset import collect_packages, sample_packages
 from smi_bench.env import load_dotenv
 from smi_bench.judge import KeyTypeScore, score_key_types
 from smi_bench.logging import JsonlLogger, default_run_id
+from smi_bench.rust import default_rust_binary, emit_bytecode_json, validate_rust_binary
+from smi_bench.schema import validate_phase1_run_json
+from smi_bench.utils import compute_json_checksum, safe_json_loads
 
 console = Console()
-
-
-def _default_rust_binary() -> Path:
-    repo_root = Path(__file__).resolve().parents[3]
-    exe = "sui_move_interface_extractor.exe" if os.name == "nt" else "sui_move_interface_extractor"
-    local = repo_root / "target" / "release" / exe
-    if local.exists():
-        return local
-    system = Path("/usr/local/bin") / exe
-    return system
 
 
 def _build_rust() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     subprocess.check_call(["cargo", "build", "--release", "--locked"], cwd=repo_root)
-
-
-def _run_rust_emit_bytecode_json(package_dir: Path, rust_bin: Path) -> dict:
-    cmd = [
-        str(rust_bin),
-        "--bytecode-package-dir",
-        str(package_dir),
-        "--emit-bytecode-json",
-        "-",
-    ]
-    out = subprocess.check_output(cmd, text=True)
-    return json.loads(out)
 
 
 def _redact_secret(v: str | None) -> str:
@@ -77,7 +75,7 @@ def _doctor_real_agent(cfg_env: dict[str, str]) -> None:
             console.print(f"models: {ids}")
         else:
             console.print(r.text[:400])
-    except Exception as e:
+    except (httpx.RequestError, httpx.HTTPStatusError, httpx.TimeoutException) as e:
         console.print(f"[red]GET {base}/models failed:[/red] {e!r}")
 
     # Probe one minimal chat completion.
@@ -97,14 +95,24 @@ def _doctor_real_agent(cfg_env: dict[str, str]) -> None:
         )
         console.print(f"POST {base}/chat/completions -> {r.status_code}")
         console.print(r.text[:400])
-    except Exception as e:
+    except (httpx.RequestError, httpx.HTTPStatusError, httpx.TimeoutException) as e:
         console.print(f"[red]POST {base}/chat/completions failed:[/red] {e!r}")
 
 
-def _build_agent_prompt(interface_json: dict, *, max_structs: int) -> str:
+def _build_agent_prompt(interface_json: dict[str, Any], *, max_structs: int) -> str:
     """
     Build a prompt that hides `abilities` to avoid trivial extraction.
-    The model must infer likely `key` structs from structure/fields.
+    
+    The model must infer likely `key` structs from structure/fields alone.
+    This prevents the benchmark from being trivial (if abilities were shown,
+    the model could just return all structs with "key" ability).
+    
+    Args:
+        interface_json: Parsed bytecode interface JSON (from Rust extractor).
+        max_structs: Maximum number of structs to include in prompt (truncation limit).
+    
+    Returns:
+        Formatted prompt string for the LLM.
     """
     package_id = interface_json.get("package_id", "<unknown>")
     modules = interface_json.get("modules", {})
@@ -165,7 +173,19 @@ def _build_agent_prompt(interface_json: dict, *, max_structs: int) -> str:
     return instructions + json.dumps(payload, indent=2, sort_keys=True)
 
 
-def _extract_key_types_from_interface_json(interface_json: dict) -> set[str]:
+def _extract_key_types_from_interface_json(interface_json: dict[str, Any]) -> set[str]:
+    """
+    Extract all struct types with 'key' ability from interface JSON.
+    
+    This is the ground truth for Phase I evaluation. The benchmark compares
+    model predictions against this set.
+    
+    Args:
+        interface_json: Parsed bytecode interface JSON (from Rust extractor).
+    
+    Returns:
+        Set of canonical type strings (format: "0xADDR::module::Struct").
+    """
     out: set[str] = set()
     modules = interface_json.get("modules")
     if not isinstance(modules, dict):
@@ -192,6 +212,15 @@ def _extract_key_types_from_interface_json(interface_json: dict) -> set[str]:
 
 
 def _find_git_root(start: Path) -> Path | None:
+    """
+    Find the git repository root by walking up from start path.
+    
+    Args:
+        start: Starting directory path.
+    
+    Returns:
+        Path to .git directory's parent, or None if not found.
+    """
     cur = start.resolve()
     while True:
         if (cur / ".git").exists():
@@ -201,13 +230,24 @@ def _find_git_root(start: Path) -> Path | None:
         cur = cur.parent
 
 
-def _git_head_for_path(path: Path) -> dict | None:
+def _git_head_for_path(path: Path) -> dict[str, str] | None:
+    """
+    Get git HEAD commit SHA for a path's repository.
+    
+    Used for run attribution metadata to track which corpus version was used.
+    
+    Args:
+        path: Path within a git repository.
+    
+    Returns:
+        Dict with "head" key containing commit SHA, or None if not in git repo or git fails.
+    """
     root = _find_git_root(path)
     if root is None:
         return None
     try:
         head = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True).strip()
-    except Exception:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         return None
     return {"head": head}
 
@@ -216,9 +256,14 @@ def _load_ids_file_ordered(path: Path) -> list[str]:
     """
     Load a newline-delimited package id list.
 
-    - Preserves file order
-    - Ignores blank lines and '#' comments
-    - Dedups while preserving first occurrence
+    Preserves file order, ignores blank lines and '#' comments, and deduplicates
+    while preserving first occurrence.
+
+    Args:
+        path: Path to newline-delimited file.
+
+    Returns:
+        List of package IDs in file order (deduplicated).
     """
     seen: set[str] = set()
     out: list[str] = []
@@ -249,16 +294,95 @@ class PackageResult:
 
 
 def _write_checkpoint(out_path: Path, run_result: RunResult) -> None:
+    """
+    Write checkpoint atomically with checksum validation.
+    
+    Uses a temporary file (.tmp suffix) and atomic replace to ensure checkpoint
+    integrity. Validates schema before writing and adds checksum for corruption detection.
+    Always cleans up .tmp file on failure.
+    
+    Args:
+        out_path: Path to checkpoint file.
+        run_result: Run result to serialize.
+    
+    Raises:
+        ValueError: If schema validation fails.
+        OSError: If file write fails.
+    """
     tmp = out_path.with_suffix(out_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(asdict(run_result), indent=2, sort_keys=True) + "\n")
-    tmp.replace(out_path)
+    try:
+        data = asdict(run_result)
+        # Validate schema before writing
+        validate_phase1_run_json(data)
+        # Add checksum for corruption detection
+        checksum = compute_json_checksum(data)
+        data["_checksum"] = checksum
+        json_str = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        tmp.write_text(json_str)
+        tmp.replace(out_path)
+    except Exception:
+        # Clean up .tmp file on failure to prevent accumulation
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except Exception:
+                pass  # Best-effort cleanup
+        raise
 
 
 def _load_checkpoint(out_path: Path) -> RunResult:
+    """
+    Load checkpoint with checksum validation.
+    
+    Reads checkpoint file, validates checksum if present, and deserializes to RunResult.
+    Provides detailed error messages for common failure modes.
+    
+    Args:
+        out_path: Path to checkpoint file.
+    
+    Returns:
+        Deserialized RunResult.
+    
+    Raises:
+        FileNotFoundError: If checkpoint file doesn't exist.
+        RuntimeError: If file read fails, JSON parse fails, checksum mismatch, or invalid shape.
+    """
     try:
-        data = json.loads(out_path.read_text())
-    except Exception as e:
-        raise RuntimeError(f"failed to parse checkpoint JSON: {out_path}") from e
+        text = out_path.read_text()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Checkpoint file not found: {out_path}\n"
+            f"  Did you mean to run without --resume?\n"
+            f"  Or check that the file path is correct."
+        ) from exc
+    except (OSError, PermissionError) as exc:
+        raise RuntimeError(
+            f"Failed to read checkpoint file: {out_path}\n"
+            f"  Error: {exc}\n"
+            f"  Check file permissions and disk space."
+        ) from exc
+
+    try:
+        data = safe_json_loads(text, context=f"checkpoint file {out_path}")
+    except ValueError as e:
+        raise RuntimeError(
+            f"Checkpoint JSON parse error: {out_path}\n"
+            f"  {e}\n"
+            f"  The checkpoint file may be corrupted. Consider removing it and restarting."
+        ) from e
+
+    # Validate checksum if present
+    stored_checksum = data.pop("_checksum", None)
+    if stored_checksum:
+        computed_checksum = compute_json_checksum(data)
+        if stored_checksum != computed_checksum:
+            raise RuntimeError(
+                f"Checkpoint checksum mismatch: {out_path}\n"
+                f"  Stored checksum: {stored_checksum}\n"
+                f"  Computed checksum: {computed_checksum}\n"
+                f"  This indicates file corruption.\n"
+                f"  Fix: Remove the checkpoint file and restart without --resume."
+            )
 
     try:
         schema_version = int(data["schema_version"])
@@ -273,11 +397,22 @@ def _load_checkpoint(out_path: Path) -> RunResult:
         agent = str(data["agent"])
         aggregate = data.get("aggregate")
         packages = data.get("packages")
-    except Exception as e:
-        raise RuntimeError(f"invalid checkpoint shape: {out_path}") from e
+    except (KeyError, ValueError, TypeError) as e:
+        missing_field = str(e).split("'")[1] if "'" in str(e) else "unknown"
+        raise RuntimeError(
+            f"Invalid checkpoint shape: {out_path}\n"
+            f"  Missing or invalid field: {missing_field}\n"
+            f"  Error: {e}\n"
+            f"  The checkpoint may be from an incompatible version. Check schema_version."
+        ) from e
 
     if not isinstance(aggregate, dict) or not isinstance(packages, list):
-        raise RuntimeError(f"invalid checkpoint shape: {out_path}")
+        raise RuntimeError(
+            f"Invalid checkpoint shape: {out_path}\n"
+            f"  Expected 'aggregate' to be dict, got {type(aggregate).__name__}\n"
+            f"  Expected 'packages' to be list, got {type(packages).__name__}\n"
+            f"  The checkpoint file may be corrupted or from an incompatible version."
+        )
 
     return RunResult(
         schema_version=schema_version,
@@ -295,13 +430,28 @@ def _load_checkpoint(out_path: Path) -> RunResult:
     )
 
 
-def _resume_results_from_checkpoint(cp: RunResult) -> tuple[list[PackageResult], set[str], int, int]:
+def _resume_results_from_checkpoint(
+    cp: RunResult, *, logger: JsonlLogger | None = None
+) -> tuple[list[PackageResult], set[str], int, int]:
+    """
+    Resume package results from a checkpoint.
+    
+    Extracts completed packages from checkpoint and reconstructs PackageResult objects.
+    Gracefully skips malformed package rows and logs skip events.
+    
+    Args:
+        cp: Checkpoint RunResult to resume from.
+        logger: Optional logger for skip events.
+    
+    Returns:
+        Tuple of (results_list, seen_package_ids_set, error_count, started_timestamp).
+    """
     results: list[PackageResult] = []
     seen: set[str] = set()
     errors = cp.aggregate.get("errors") if isinstance(cp.aggregate, dict) else 0
     try:
         error_count = int(errors)
-    except Exception:
+    except (ValueError, TypeError):
         error_count = 0
 
     for row in cp.packages:
@@ -315,7 +465,10 @@ def _resume_results_from_checkpoint(cp: RunResult) -> tuple[list[PackageResult],
             continue
         try:
             score = KeyTypeScore(**score_d)
-        except Exception:
+        except (TypeError, ValueError) as e:
+            # Log but continue - malformed score shouldn't break resume
+            if logger is not None:
+                logger.event("checkpoint_resume_skip", package_id=pkg_id, reason=f"invalid score: {e}")
             continue
         truth_k = int(row.get("truth_key_types", 0))
         pred_k = int(row.get("predicted_key_types", 0))
@@ -337,18 +490,32 @@ def _resume_results_from_checkpoint(cp: RunResult) -> tuple[list[PackageResult],
 
 @dataclass
 class RunResult:
+    """
+    Phase I benchmark run result (schema contract).
+
+    Schema versioning:
+    - Increment `schema_version` when adding/removing/renaming fields or changing semantics.
+    - Backward compatibility: older readers should handle missing optional fields gracefully.
+    - Determinism: `packages` list order should be stable (sorted by package_id) for reproducible diffs.
+
+    Field contracts:
+    - `schema_version`: integer, must match expected version for strict validation.
+    - `aggregate`: dict with keys like `"avg_f1"`, `"avg_precision"`, `"avg_recall"`, `"errors"`, `"timeouts"`.
+    - `packages`: list of dicts, each with `"package_id"`, `"score"` (KeyTypeScore dict), `"truth_key_types"`, `"predicted_key_types"`.
+    """
+
     schema_version: int
     started_at_unix_seconds: int
     finished_at_unix_seconds: int
     corpus_root_name: str
-    corpus_git: dict | None
+    corpus_git: dict[str, str] | None
     target_ids_file: str | None
     target_ids_total: int | None
     samples: int
     seed: int
     agent: str
-    aggregate: dict
-    packages: list[dict]
+    aggregate: dict[str, Any]
+    packages: list[dict[str, Any]]
 
 
 def run(
@@ -374,12 +541,49 @@ def run(
     log_dir: Path | None,
     run_id: str | None,
 ) -> RunResult:
+    """
+    Run Phase I benchmark (key-struct discovery).
+    
+    Processes packages from corpus, extracts key types from bytecode, prompts LLM
+    to predict key types, and scores predictions. Supports checkpointing and resume.
+    
+    Args:
+        corpus_root: Root directory of sui-packages-style corpus.
+        samples: Number of packages to sample (0 = all).
+        seed: Random seed for sampling.
+        package_ids_file: Optional file with specific package IDs to process.
+        agent_name: Agent name ("mock-*" or "real-openai-compatible").
+        rust_bin: Path to Rust extractor binary.
+        build_rust: If True, build Rust binary before running.
+        out_path: Optional path to write checkpoint JSON.
+        env_file: Optional path to .env file for agent config.
+        max_structs_in_prompt: Maximum structs to include in prompt (truncation).
+        smoke_agent: If True, run smoke test on agent and exit.
+        doctor_agent: If True, run diagnostics on agent and exit.
+        continue_on_error: If True, continue processing after errors.
+        max_errors: Maximum errors before stopping (if continue_on_error=True).
+        checkpoint_every: Write checkpoint every N packages (0 = disabled).
+        resume: If True, resume from existing checkpoint at out_path.
+        per_package_timeout_seconds: Timeout per package in seconds.
+        include_type_lists: If True, include type lists in output.
+        log_dir: Directory for JSONL logs (None = disabled).
+        run_id: Optional run ID for logs (auto-generated if None).
+    
+    Returns:
+        RunResult with aggregated scores and package results.
+    
+    Raises:
+        SystemExit: If binary validation fails or too many errors encountered.
+    """
     if build_rust:
         console.print("[bold]building rust…[/bold]")
         _build_rust()
 
-    if not rust_bin.exists():
-        raise SystemExit(f"rust binary not found: {rust_bin} (run `cargo build --release --locked`)")
+    # Validate binary exists and is executable
+    try:
+        rust_bin = validate_rust_binary(rust_bin)
+    except (FileNotFoundError, PermissionError) as e:
+        raise SystemExit(str(e)) from e
 
     env_overrides = load_dotenv(env_file) if env_file is not None else {}
 
@@ -466,7 +670,7 @@ def run(
         deadline = pkg_started + per_package_timeout_seconds
         if logger is not None:
             logger.event("package_started", package_id=pkg.package_id, i=pkg_i)
-        interface_json = _run_rust_emit_bytecode_json(Path(pkg.package_dir), rust_bin)
+        interface_json = emit_bytecode_json(package_dir=Path(pkg.package_dir), rust_bin=rust_bin)
         truth = _extract_key_types_from_interface_json(interface_json)
         predicted: set[str] = set()
         err: str | None = None
@@ -489,7 +693,9 @@ def run(
                     predicted = real_agent.complete_type_list(prompt, timeout_s=max(1.0, remaining))
                     last_exc = None
                     break
-                except Exception as e:
+                except Exception as e:  # pylint: disable=broad-except
+                    # Catch all exceptions: agent may raise TimeoutError, ValueError, or other errors.
+                    # We handle specific cases and break on others.
                     last_exc = e
                     msg = str(e)
                     if isinstance(e, TimeoutError):
@@ -514,9 +720,18 @@ def run(
         if err is not None:
             error_count += 1
             if not continue_on_error:
-                raise RuntimeError(err)
+                raise RuntimeError(
+                    f"Package processing failed: {pkg.package_id}\n"
+                    f"  Error: {err}\n"
+                    f"  Check package structure and agent configuration."
+                )
             if error_count > max_errors:
-                raise RuntimeError(f"too many errors ({error_count} > {max_errors}); last_error={err}")
+                raise RuntimeError(
+                    f"Too many errors encountered: {error_count} > {max_errors}\n"
+                    f"  Last error: {err}\n"
+                    f"  Increase --max-errors or fix underlying issues.\n"
+                    f"  Check logs for details on failed packages."
+                )
 
         score = score_key_types(truth, predicted)
         elapsed_s = time.monotonic() - pkg_started
@@ -562,9 +777,12 @@ def run(
 
         if out_path is not None and checkpoint_every > 0 and (pkg_i % checkpoint_every) == 0:
             finished = int(time.time())
-            avg_f1 = sum(r.score.f1 for r in results) / len(results)
-            avg_recall = sum(r.score.recall for r in results) / len(results)
-            avg_precision = sum(r.score.precision for r in results) / len(results)
+            if len(results) > 0:
+                avg_f1 = sum(r.score.f1 for r in results) / len(results)
+                avg_recall = sum(r.score.recall for r in results) / len(results)
+                avg_precision = sum(r.score.precision for r in results) / len(results)
+            else:
+                avg_f1 = avg_recall = avg_precision = 0.0
             partial = RunResult(
                 schema_version=1,
                 started_at_unix_seconds=started,
@@ -603,9 +821,12 @@ def run(
 
     finished = int(time.time())
 
-    avg_f1 = sum(r.score.f1 for r in results) / len(results)
-    avg_recall = sum(r.score.recall for r in results) / len(results)
-    avg_precision = sum(r.score.precision for r in results) / len(results)
+    if len(results) > 0:
+        avg_f1 = sum(r.score.f1 for r in results) / len(results)
+        avg_recall = sum(r.score.recall for r in results) / len(results)
+        avg_precision = sum(r.score.precision for r in results) / len(results)
+    else:
+        avg_f1 = avg_recall = avg_precision = 0.0
 
     run_result = RunResult(
         schema_version=1,
@@ -680,7 +901,7 @@ def main(argv: list[str] | None = None) -> None:
             "real-openai-compatible",
         ],
     )
-    parser.add_argument("--rust-bin", type=Path, default=_default_rust_binary())
+    parser.add_argument("--rust-bin", type=Path, default=default_rust_binary())
     parser.add_argument("--build-rust", action="store_true")
     parser.add_argument("--out", type=Path)
     parser.add_argument(

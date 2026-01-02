@@ -17,34 +17,9 @@ from smi_bench.inhabit.executable_subset import (
     compute_package_viability,
 )
 from smi_bench.runner import _extract_key_types_from_interface_json
+from smi_bench.rust import default_rust_binary, emit_bytecode_json
 
 console = Console()
-
-
-def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[3]
-
-
-def _default_rust_binary() -> Path:
-    exe = "sui_move_interface_extractor.exe" if os.name == "nt" else "sui_move_interface_extractor"
-    local = _repo_root() / "target" / "release" / exe
-    if local.exists():
-        return local
-    return Path("/usr/local/bin") / exe
-
-
-def _run_rust_emit_bytecode_json(*, bytecode_package_dir: Path, rust_bin: Path) -> dict:
-    out = subprocess.check_output(
-        [
-            str(rust_bin),
-            "--bytecode-package-dir",
-            str(bytecode_package_dir),
-            "--emit-bytecode-json",
-            "-",
-        ],
-        text=True,
-    )
-    return json.loads(out)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -52,7 +27,7 @@ def main(argv: list[str] | None = None) -> None:
         description="Phase II: generate an executable-subset manifest (ids + PTB planfile) from a bytecode corpus"
     )
     p.add_argument("--corpus-root", type=Path, required=True)
-    p.add_argument("--rust-bin", type=Path, default=_default_rust_binary())
+    p.add_argument("--rust-bin", type=Path, default=default_rust_binary())
     p.add_argument("--out-ids", type=Path, required=True, help="Write selected package ids (one per line).")
     p.add_argument("--out-plan", type=Path, required=True, help="Write JSON mapping package_id -> PTB spec.")
     p.add_argument("--out-report", type=Path, help="Optional JSON report with summary counts and sample selections.")
@@ -88,7 +63,7 @@ def main(argv: list[str] | None = None) -> None:
 
     for pkg in track(packages, description="select"):
         try:
-            iface = _run_rust_emit_bytecode_json(bytecode_package_dir=Path(pkg.package_dir), rust_bin=args.rust_bin)
+            iface = emit_bytecode_json(package_dir=Path(pkg.package_dir), rust_bin=args.rust_bin)
         except Exception as e:
             stats = SelectStats(
                 packages_total=stats.packages_total,

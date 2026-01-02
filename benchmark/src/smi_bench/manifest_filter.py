@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+
+def main(argv: list[str] | None = None) -> None:
+    p = argparse.ArgumentParser(description="Filter a Phase II run JSON into a manifest")
+    p.add_argument("out_json", type=Path, help="Phase II output JSON (from smi-inhabit)")
+    p.add_argument("--min-targets", type=int, default=2, help="Keep packages with score.targets >= N")
+    p.add_argument("--out-manifest", type=Path, required=True, help="Output manifest file (one package id per line)")
+    args = p.parse_args(argv)
+
+    data = json.loads(args.out_json.read_text(encoding="utf-8"))
+    rows = data.get("packages")
+    if not isinstance(rows, list):
+        raise SystemExit("invalid out json: missing packages[]")
+
+    out_ids: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        pkg = row.get("package_id")
+        score = row.get("score")
+        if not isinstance(pkg, str) or not pkg:
+            continue
+        if not isinstance(score, dict):
+            continue
+        targets = score.get("targets")
+        try:
+            targets_i = int(targets)
+        except Exception:
+            continue
+        if targets_i >= args.min_targets:
+            out_ids.append(pkg)
+
+    args.out_manifest.parent.mkdir(parents=True, exist_ok=True)
+    args.out_manifest.write_text("\n".join(out_ids) + ("\n" if out_ids else ""), encoding="utf-8")
+    print(f"packages_kept={len(out_ids)}")
+
+
+if __name__ == "__main__":
+    main()

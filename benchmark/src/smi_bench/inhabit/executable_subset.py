@@ -1,5 +1,19 @@
 from __future__ import annotations
 
+"""
+Deterministic Phase II helper logic (baseline-search + interface summaries).
+
+This module is intentionally conservative and deterministic:
+- It selects public entry functions, attempts to construct arguments with simple rules,
+  and emits a PTB call sequence that the Rust `smi_tx_sim` helper can build.
+- It provides `summarize_interface()` for prompting (entry-first ordering, stable truncation).
+
+Refactor invariants:
+- Keep ordering stable (sorted modules/functions).
+- Keep arg construction rules in sync with what `smi_tx_sim` supports.
+- Avoid deep recursion or unbounded search; this is a baseline + substrate, not a solver.
+"""
+
 from dataclasses import dataclass, field
 
 DUMMY_ADDRESS = "0x" + ("1" * 64)
@@ -211,9 +225,21 @@ def json_type_to_string(t: dict) -> str:
     return "unknown"
 
 
-def summarize_interface(interface_json: dict, max_functions: int = 200) -> str:
-    """
-    Generate a concise human-readable summary of public/entry functions.
+def summarize_interface(
+    interface_json: dict,
+    max_functions: int = 200,
+    *,
+    mode: str = "entry_then_public",
+    requested_targets: set[str] | None = None,
+) -> str:
+    """Generate a human-readable summary of functions for prompting.
+
+    Modes:
+      - "entry_then_public" (default): entry functions first, then public.
+      - "entry_only": only entry functions.
+      - "names_only": only module + function names (no signatures).
+      - "focused": include only functions whose fully-qualified target string
+        ("0xADDR::module::function") is in `requested_targets`.
     """
     modules = interface_json.get("modules")
     if not isinstance(modules, dict):
@@ -223,6 +249,21 @@ def summarize_interface(interface_json: dict, max_functions: int = 200) -> str:
     lines = []
     lines.append(f"Package: {pkg_id}")
     lines.append("")
+
+    if mode not in {"entry_then_public", "entry_only", "names_only", "focused"}:
+        mode = "entry_then_public"
+
+    requested_targets = requested_targets or set()
+    requested_by_mod: dict[str, set[str]] = {}
+    for tgt in requested_targets:
+        if not isinstance(tgt, str):
+            continue
+        parts = tgt.split("::")
+        if len(parts) < 3:
+            continue
+        mod = parts[-2]
+        fn = parts[-1]
+        requested_by_mod.setdefault(mod, set()).add(fn)
 
     total_funs_added = 0
 
@@ -238,28 +279,41 @@ def summarize_interface(interface_json: dict, max_functions: int = 200) -> str:
         if not isinstance(funs, dict):
             continue
 
-        module_lines = []
+        module_lines: list[str] = []
         # Prioritize entry functions, then public functions
         sorted_funs = sorted(funs.items(), key=lambda x: (not x[1].get("is_entry", False), x[0]))
 
         for fun_name, f in sorted_funs:
             if total_funs_added >= max_functions:
                 break
-            if f.get("visibility") != "public" and f.get("is_entry") is not True:
-                continue
+            is_entry = f.get("is_entry") is True
+            is_public = f.get("visibility") == "public"
 
-            # Signature construction
-            vis = f.get("visibility", "private")
-            entry = " entry" if f.get("is_entry") else ""
-            params = f.get("params", [])
-            param_strs = [json_type_to_string(p) for p in params if isinstance(p, dict)]
-            sig = f"{vis}{entry} fun {fun_name}({', '.join(param_strs)})"
+            if mode == "focused":
+                wanted = requested_by_mod.get(module_name)
+                if not wanted or fun_name not in wanted:
+                    continue
+            else:
+                if mode == "entry_only" and not is_entry:
+                    continue
+                if not is_public and not is_entry:
+                    continue
 
-            type_params = f.get("type_params", [])
-            if type_params:
-                sig = f"{vis}{entry} fun {fun_name}<{len(type_params)} type params>({', '.join(param_strs)})"
+            if mode == "names_only":
+                module_lines.append(f"  - {fun_name}")
+            else:
+                # Signature construction
+                vis = f.get("visibility", "private")
+                entry = " entry" if is_entry else ""
+                params = f.get("params", [])
+                param_strs = [json_type_to_string(p) for p in params if isinstance(p, dict)]
+                sig = f"{vis}{entry} fun {fun_name}({', '.join(param_strs)})"
 
-            module_lines.append(f"  - {sig}")
+                type_params = f.get("type_params", [])
+                if type_params:
+                    sig = f"{vis}{entry} fun {fun_name}<{len(type_params)} type params>({', '.join(param_strs)})"
+
+                module_lines.append(f"  - {sig}")
             total_funs_added += 1
 
         if module_lines:
