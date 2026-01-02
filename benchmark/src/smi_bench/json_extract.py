@@ -22,32 +22,13 @@ def _strip_code_fences(text: str) -> str:
 def extract_json_value(text: str) -> object:
     """
     Best-effort JSON extraction from a model response.
-    Accepts:
-      - raw JSON
-      - JSON wrapped in ```json fences
-      - extra prose around a JSON blob (extract first {...} or [...] span)
+    Handles Raw JSON, Markdown fences, and prose-embedded JSON.
     """
     s = _strip_code_fences(text)
     try:
-        return safe_json_loads(s, context="model response JSON extraction")
-    except ValueError:
-        pass
-
-    # Try to find the first top-level JSON array/object substring.
-    for opener, closer in (("[", "]"), ("{", "}")):
-        start = s.find(opener)
-        if start == -1:
-            continue
-        end = s.rfind(closer)
-        if end == -1 or end <= start:
-            continue
-        candidate = s[start : end + 1]
-        try:
-            return safe_json_loads(candidate, context=f"extracted JSON substring ({opener}...{closer})")
-        except ValueError:
-            continue
-
-    raise JsonExtractError("no JSON found in model output")
+        return safe_json_loads(s, context="model response extraction")
+    except ValueError as e:
+        raise JsonExtractError(f"no JSON found: {e}") from e
 
 
 def extract_type_list(text: str) -> set[str]:

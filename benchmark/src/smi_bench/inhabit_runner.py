@@ -36,6 +36,13 @@ from smi_bench.agents.real_agent import RealAgent, load_real_agent_config
 from smi_bench.dataset import collect_packages, sample_packages
 from smi_bench.env import load_dotenv
 from smi_bench.inhabit.dryrun import DryRunFailure, classify_dry_run_response
+from smi_bench.inhabit.engine import (
+    check_run_guards,
+    fetch_inventory,
+    ptb_variants,
+    resolve_placeholders,
+    run_tx_sim_via_helper,
+)
 from smi_bench.inhabit.executable_subset import (
     analyze_package,
     summarize_interface,
@@ -59,35 +66,15 @@ from smi_bench.utils import (
 console = Console()
 
 
-def _pid_is_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        # Signal 0 does not kill the process; it checks existence/permission.
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Exists but we might not be allowed to signal it.
-        return True
-    else:
-        return True
+def _ptb_variants(
+    ptb_spec_base: dict,
+    *,
+    sender: str,
+    max_variants: int,
+) -> list[dict]:
+    """Backward-compatible wrapper for tests expecting `_ptb_variants` in this module."""
 
-
-def _check_run_guards(*, parent_pid: int | None, run_deadline: float | None) -> None:
-    if parent_pid is not None and parent_pid > 0 and not _pid_is_alive(parent_pid):
-        raise RuntimeError(
-            f"Parent process exited (pid={parent_pid})\n"
-            f"  The benchmark run will stop to prevent orphaned execution.\n"
-            f"  This is expected if the parent process was terminated."
-        )
-    if run_deadline is not None and time.monotonic() >= run_deadline:
-        raise TimeoutError(
-            f"Maximum run time exceeded\n"
-            f"  Deadline: {run_deadline:.1f}s\n"
-            f"  Current: {time.monotonic():.1f}s\n"
-            f"  The benchmark run has been stopped to respect the time limit."
-        )
+    return ptb_variants(ptb_spec_base, sender=sender, max_variants=max_variants)
 
 
 def _run_rust_emit_bytecode_json(bytecode_package_dir: Path, rust_bin: Path) -> dict[str, Any]:
@@ -106,118 +93,6 @@ def _run_rust_emit_bytecode_json(bytecode_package_dir: Path, rust_bin: Path) -> 
         Parsed interface JSON dict.
     """
     return emit_bytecode_json(package_dir=bytecode_package_dir, rust_bin=rust_bin)
-
-
-def _fetch_inventory(rpc_url: str, sender: str) -> dict[str, list[str]]:
-    """
-    Fetch owned objects for sender and group by type.
-
-    Used to resolve placeholder arguments in PTB plans. Fetches all owned objects
-    via paginated RPC calls and groups them by normalized type string.
-
-    Args:
-        rpc_url: Sui RPC endpoint URL.
-        sender: Sender address (must start with "0x").
-
-    Returns:
-        Dict mapping normalized type strings to lists of object IDs.
-        Example: {"0x2::coin::Coin<0x2::sui::SUI>": ["0xID1", "0xID2"]}
-
-    Note:
-        Returns empty dict on any error (network, RPC, parsing) to keep function
-        side-effect-free and simplify testing.
-    """
-    if sender == "0x0" or not sender.startswith("0x"):
-        return {}
-
-    try:
-        # Simple paginated fetch of all owned objects
-        objects = []
-        cursor = None
-        while True:
-            payload = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "suix_getOwnedObjects",
-                "params": [sender, {"filter": None, "options": {"showType": True}}, cursor, 50],
-            }
-            # Using synchronous httpx.post? We imported httpx.
-            # But httpx is usually async or used via client.
-            # We can use `httpx.post` (sync).
-            # But wait, `inhabit_runner.py` uses `subprocess` mostly.
-            # `httpx` is imported.
-            resp = httpx.post(rpc_url, json=payload, timeout=30)
-            if resp.status_code != 200:
-                break
-            res = resp.json()
-            if "error" in res:
-                break
-            data = res.get("result", {})
-            for item in data.get("data", []):
-                objects.append(item)
-            if not data.get("hasNextPage"):
-                break
-            cursor = data.get("nextCursor")
-            # Limit inventory fetch to avoid huge wallets slowing down benchmark
-            if len(objects) > 200:
-                break
-
-        inventory = {}
-        for obj in objects:
-            t = obj.get("data", {}).get("type")
-            oid = obj.get("data", {}).get("objectId")
-            if t and oid:
-                t_norm = normalize_type_string(t)
-                if t_norm not in inventory:
-                    inventory[t_norm] = []
-                inventory[t_norm].append(oid)
-        return inventory
-    except (httpx.RequestError, httpx.HTTPStatusError, httpx.TimeoutException, ValueError, KeyError):
-        # Fail gracefully on inventory fetch (network issues, RPC errors, or malformed response).
-        # Note: keep this function side-effect-free (no logger dependency) to simplify testing.
-        return {}
-
-
-def _resolve_placeholders(ptb_spec: dict[str, Any], inventory: dict[str, list[str]]) -> bool:
-    """
-    Replace placeholder arguments in PTB spec with actual object IDs from inventory.
-
-    Resolves {"$smi_placeholder": "Type"} arguments by finding matching objects
-    in the inventory and replacing with {"imm_or_owned_object": "ID"}.
-
-    Args:
-        ptb_spec: PTB specification dict (modified in-place).
-        inventory: Dict mapping normalized type strings to object ID lists.
-
-    Returns:
-        True if all placeholders were resolved, False otherwise.
-    """
-    resolved_all = True
-
-    for call in ptb_spec.get("calls", []):
-        if not isinstance(call, dict):
-            continue
-        args = call.get("args", [])
-        for i, arg in enumerate(args):
-            if not isinstance(arg, dict):
-                continue
-
-            ph = arg.get("$smi_placeholder")
-            if ph:
-                # Resolve it
-                ph_norm = normalize_type_string(ph)
-                candidates = inventory.get(ph_norm)
-                if candidates:
-                    # Pick the first one (deterministic)
-                    args[i] = {"imm_or_owned_object": candidates[0]}
-                else:
-                    # If we don't have inventory (common in build-only scans with sender=0x0),
-                    # replace placeholders with a deterministic dummy object id.
-                    # This keeps the transaction builder from failing on unsupported arg kinds.
-                    args[i] = {"imm_or_owned_object": "0x0"}
-                    resolved_all = False
-
-    return resolved_all
 
 
 def _parse_gas_budget_ladder(s: str) -> list[int]:
@@ -302,141 +177,6 @@ def _resolve_sender_and_gas_coin(
     return resolved_sender, resolved_gas_coin
 
 
-_INT_ARG_KEYS: tuple[str, ...] = (
-    "u8",
-    "u16",
-    "u32",
-    "u64",
-    "u128",
-    "u256",
-)
-
-
-def _rewrite_ptb_addresses_in_place(ptb_spec: dict[str, Any], *, sender: str) -> bool:
-    """
-    Rewrite address arguments in PTB spec to use sender address.
-
-    Modifies PTB spec in-place, replacing address arguments with sender address.
-    Used to create address-rewritten variants of PTB plans.
-
-    Args:
-        ptb_spec: PTB specification dict (modified in-place).
-        sender: Sender address to use for rewriting.
-
-    Returns:
-        True if any addresses were changed, False otherwise.
-    """
-    """
-    Heuristic rewrite: replace any `address` / `vector_address` args with `sender`.
-
-    Useful when a plan uses placeholder addresses but otherwise has a valid call target/shape.
-    """
-    changed = False
-    for call in ptb_spec.get("calls", []):
-        if not isinstance(call, dict):
-            continue
-        args = call.get("args", [])
-        if not isinstance(args, list):
-            continue
-        for arg in args:
-            if not isinstance(arg, dict) or len(arg) != 1:
-                continue
-            k = next(iter(arg.keys()))
-            if k == "address" and isinstance(arg.get(k), str):
-                if arg[k] != sender:
-                    arg[k] = sender
-                    changed = True
-            elif k == "vector_address" and isinstance(arg.get(k), list):
-                v = arg[k]
-                if v != [sender] * len(v):
-                    arg[k] = [sender] * len(v)
-                    changed = True
-    return changed
-
-
-def _rewrite_ptb_ints_in_place(ptb_spec: dict[str, Any], *, value: int) -> bool:
-    """
-    Rewrite integer arguments in PTB spec to a specific value.
-
-    Modifies PTB spec in-place, replacing integer arguments with the specified value.
-    Used to create integer-rewritten variants of PTB plans.
-
-    Args:
-        ptb_spec: PTB specification dict (modified in-place).
-        value: Integer value to use for rewriting.
-
-    Returns:
-        True if any integers were changed, False otherwise.
-    """
-    """
-    Heuristic rewrite: replace any integer-typed pure args with `value`.
-
-    Useful for retrying common MoveAbort conditions caused by invalid literals.
-    """
-    changed = False
-    for call in ptb_spec.get("calls", []):
-        if not isinstance(call, dict):
-            continue
-        args = call.get("args", [])
-        if not isinstance(args, list):
-            continue
-        for arg in args:
-            if not isinstance(arg, dict) or len(arg) != 1:
-                continue
-            k = next(iter(arg.keys()))
-            if k in _INT_ARG_KEYS:
-                cur = arg.get(k)
-                if isinstance(cur, int) and cur != value:
-                    arg[k] = value
-                    changed = True
-    return changed
-
-
-def _ptb_variants(base_spec: dict[str, Any], *, sender: str, max_variants: int) -> list[tuple[str, dict[str, Any]]]:
-    """
-    Generate deterministic, bounded PTB variants for local adaptation.
-
-    Creates variants by modifying addresses and integer arguments in the base spec.
-    This allows the benchmark to try multiple approaches within a fixed budget
-    without making LLM calls.
-
-    Args:
-        base_spec: Base PTB specification dict.
-        sender: Sender address for address rewriting.
-        max_variants: Maximum number of variants to return.
-
-    Returns:
-        List of (variant_name, spec_dict) tuples. Variants are deterministic
-        and bounded to keep corpus runs fast and diff-stable.
-    """
-    if max_variants <= 0:
-        return []
-
-    variants: list[tuple[str, dict[str, Any]]] = []
-    seen: set[str] = set()
-
-    def _add(name: str, spec: dict[str, Any]) -> None:
-        key = json.dumps(spec, sort_keys=True, separators=(",", ":"))
-        if key in seen:
-            return
-        seen.add(key)
-        variants.append((name, spec))
-
-    _add("base", copy.deepcopy(base_spec))
-
-    if sender and sender != "0x0":
-        v = copy.deepcopy(base_spec)
-        if _rewrite_ptb_addresses_in_place(v, sender=sender):
-            _add("addr_sender", v)
-
-    for n in (0, 2, 10, 100):
-        v = copy.deepcopy(base_spec)
-        if _rewrite_ptb_ints_in_place(v, value=n):
-            _add(f"ints_{n}", v)
-
-    return variants[:max_variants]
-
-
 def _summarize_inventory(inventory: dict[str, list[str]]) -> str:
     """
     Format inventory dict as a human-readable string for LLM prompts.
@@ -488,154 +228,22 @@ def _load_ids_file_ordered(path: Path) -> list[str]:
     return out
 
 
-def _run_tx_sim_via_helper(
-    *,
-    dev_inspect_bin: Path,
-    rpc_url: str,
-    sender: str,
-    mode: str,
-    gas_budget: int | None,
-    gas_coin: str | None,
-    bytecode_package_dir: Path | None,
-    ptb_spec: dict[str, Any],
-    timeout_s: float,
-) -> tuple[dict[str, Any] | None, set[str], set[str], str]:
+def _summarize_inventory(inventory: dict[str, list[str]]) -> str:
     """
-    Run transaction simulation via Rust helper with proper temp file cleanup.
-
-    Writes PTB spec to a temporary file, invokes the Rust helper binary, and
-    parses the response. Always cleans up the temp file, even on error.
+    Format inventory dict as a human-readable string for LLM prompts.
 
     Args:
-        dev_inspect_bin: Path to smi_tx_sim binary.
-        rpc_url: Sui RPC endpoint URL.
-        sender: Sender address.
-        mode: Simulation mode ("dry-run", "dev-inspect", "build-only").
-        gas_budget: Gas budget for transaction (optional).
-        gas_coin: Gas coin object ID (optional).
-        bytecode_package_dir: Path to bytecode package directory (optional).
-        ptb_spec: PTB specification dict.
-        timeout_s: Timeout in seconds for subprocess call.
+        inventory: Dict mapping type strings to object ID lists.
 
     Returns:
-        Tuple of (tx_output_dict, created_types_set, static_types_set, mode_used).
-        tx_output_dict may be None if simulation failed.
-
-    Raises:
-        TimeoutError: If subprocess times out.
-        RuntimeError: If subprocess fails or returns invalid JSON.
+        Formatted string describing owned objects grouped by type.
     """
-    # Write a temporary PTB spec file (small, single package).
-    tmp_dir = get_smi_temp_dir()
-    tmp_path = tmp_dir / f"ptb_spec_{int(time.time() * 1000)}.json"
-    try:
-        tmp_path.write_text(json.dumps(ptb_spec, indent=2, sort_keys=True) + "\n")
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to write temp PTB spec: {tmp_path}\n"
-            f"  Error: {e}\n"
-            f"  Check disk space and write permissions for: {tmp_path.parent}"
-        ) from e
-
-    try:
-        cmd = [
-            str(dev_inspect_bin),
-            "--rpc-url",
-            rpc_url,
-            "--sender",
-            sender,
-            "--mode",
-            mode,
-            "--ptb-spec",
-            str(tmp_path),
-        ]
-        if gas_budget is not None:
-            cmd += ["--gas-budget", str(gas_budget)]
-        if gas_coin is not None:
-            cmd += ["--gas-coin", gas_coin]
-        if bytecode_package_dir is not None:
-            cmd += ["--bytecode-package-dir", str(bytecode_package_dir)]
-
-        try:
-            data = run_json_helper(
-                cmd,
-                timeout_s=timeout_s,
-                context=f"transaction simulation output ({mode})",
-            )
-        except TimeoutError as e:
-            raise TimeoutError(
-                f"Transaction simulation timed out after {timeout_s}s\n"
-                f"  Mode: {mode}\n"
-                f"  RPC: {rpc_url}\n"
-                f"  This may indicate network issues or a very complex transaction."
-            ) from e
-        except RuntimeError as e:
-            # Re-wrap RuntimeError to maintain existing error message format expected by callers/tests
-            # or just let it bubble up. The original code raised RuntimeError.
-            # `run_json_helper` raises RuntimeError with detail.
-            # We can just let it bubble or wrap it if we want specific phrasing.
-            # The original code added "Check RPC connectivity..." hints.
-            raise RuntimeError(f"Transaction simulation failed: {e}") from e
-
-        mode_used = data.get("modeUsed") if isinstance(data.get("modeUsed"), str) else "unknown"
-        created_types = data.get("createdObjectTypes")
-        static_types = data.get("staticCreatedObjectTypes")
-        dry_run = data.get("dryRun")
-        dev_inspect = data.get("devInspect")
-
-        created_set = (
-            {t for t in created_types if isinstance(t, str) and t} if isinstance(created_types, list) else set()
-        )
-        static_set = {t for t in static_types if isinstance(t, str) and t} if isinstance(static_types, list) else set()
-
-        # Prefer dry-run if present, otherwise dev-inspect (best-effort).
-        tx_out = None
-        if isinstance(dry_run, dict):
-            tx_out = dry_run
-        elif isinstance(dev_inspect, dict):
-            tx_out = dev_inspect
-
-        return tx_out, created_set, static_set, mode_used
-    finally:
-        # Always clean up temp file
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except Exception:
-            # Best-effort cleanup; log but don't fail
-            pass
-
-
-def _persist_ptb_spec_for_debug(
-    *,
-    logger: JsonlLogger | None,
-    package_id: str,
-    plan_attempt: int,
-    plan_variant: str | None,
-    sim_attempt: int,
-    ptb_spec: dict[str, Any],
-) -> None:
-    """
-    Persist PTB spec to debug directory for inspection.
-
-    Writes PTB spec to a file in the debug directory for post-mortem analysis.
-    Only writes if logger is provided (debug mode enabled).
-
-    Args:
-        logger: Logger instance (if None, function does nothing).
-        package_id: Package ID being processed.
-        plan_attempt: Plan attempt number.
-        plan_variant: Plan variant name (e.g., "base", "addr_sender").
-        sim_attempt: Simulation attempt number.
-        ptb_spec: PTB specification dict to persist.
-    """
-    if logger is None:
-        return
-    out_dir = logger.paths.root / "ptb_specs"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    variant = plan_variant or "base"
-    out_path = out_dir / f"{package_id}_plan{plan_attempt}_{variant}_sim{sim_attempt}.json"
-    out_path.write_text(json.dumps(ptb_spec, indent=2, sort_keys=True) + "\n")
+    if not inventory:
+        return "Your inventory is empty or could not be fetched."
+    lines = ["You own the following objects (grouped by type):"]
+    for t, ids in sorted(inventory.items()):
+        lines.append(f"- {t}: {len(ids)} objects available")
+    return "\n".join(lines)
 
 
 def _run_tx_sim_with_fallback(
@@ -651,33 +259,11 @@ def _run_tx_sim_with_fallback(
     require_dry_run: bool,
 ) -> tuple[dict[str, Any] | None, set[str], set[str], str, bool, bool, str | None]:
     """
-    Run transaction simulation with fallback from dry-run to dev-inspect.
-
-    Tries dry-run first, then falls back to dev-inspect if dry-run fails and
-    require_dry_run is False. This provides graceful degradation for packages
-    that can't be dry-run but can be dev-inspected.
-
-    Args:
-        sim_bin: Path to smi_tx_sim binary.
-        rpc_url: Sui RPC endpoint URL.
-        sender: Sender address.
-        gas_budget: Gas budget for transaction (optional).
-        gas_coin: Gas coin object ID (optional).
-        bytecode_package_dir: Path to bytecode package directory (optional).
-        ptb_spec: PTB specification dict.
-        timeout_s: Timeout in seconds for subprocess call.
-        require_dry_run: If True, don't fall back to dev-inspect on dry-run failure.
-
-    Returns:
-        Tuple of (tx_output_dict, created_types_set, static_types_set, mode_used,
-        dry_run_ok, fell_back_to_dev_inspect, dry_run_error).
-    """
-    """
     Attempt dry-run first to get transaction-ground-truth created types.
     If dry-run fails and require_dry_run is false, fall back to dev-inspect (static types only).
     """
     try:
-        tx_out, created, static_created, mode_used = _run_tx_sim_via_helper(
+        tx_out, created, static_created, mode_used = run_tx_sim_via_helper(
             dev_inspect_bin=sim_bin,
             rpc_url=rpc_url,
             sender=sender,
@@ -688,62 +274,25 @@ def _run_tx_sim_with_fallback(
             ptb_spec=ptb_spec,
             timeout_s=timeout_s,
         )
-        # If dry-run succeeded, created types should already be present.
         return tx_out, created, static_created, mode_used, False, True, None
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, RuntimeError, ValueError, TimeoutError) as e:
+    except Exception as e:
         if require_dry_run:
             raise
         dry_run_err = str(e)
 
-    # Dev-inspect fallback: we still call the helper in dev-inspect mode to keep outputs consistent,
-    # but scoring relies on static types because dev-inspect does not include object type strings.
-    tmp_dir = get_smi_temp_dir()
-    tmp_path = tmp_dir / f"ptb_spec_{int(time.time() * 1000)}.json"
-    try:
-        tmp_path.write_text(json.dumps(ptb_spec, indent=2, sort_keys=True) + "\n")
-    except Exception as e:
-        raise RuntimeError(f"failed to write temp PTB spec for dev-inspect fallback: {tmp_path}") from e
-    try:
-        cmd = [
-            str(sim_bin),
-            "--rpc-url",
-            rpc_url,
-            "--sender",
-            sender,
-            "--mode",
-            "dev-inspect",
-            "--ptb-spec",
-            str(tmp_path),
-        ]
-        if gas_budget is not None:
-            cmd += ["--gas-budget", str(gas_budget)]
-        if gas_coin is not None:
-            cmd += ["--gas-coin", gas_coin]
-        if bytecode_package_dir is not None:
-            cmd += ["--bytecode-package-dir", str(bytecode_package_dir)]
-
-        data = run_json_helper(
-            cmd,
-            timeout_s=timeout_s,
-            context="tx sim helper output (dev-inspect fallback)",
-        )
-
-        mode_used = data.get("modeUsed") if isinstance(data.get("modeUsed"), str) else "unknown"
-        created_types = data.get("createdObjectTypes")
-        static_types = data.get("staticCreatedObjectTypes")
-        created_set = (
-            {t for t in created_types if isinstance(t, str) and t} if isinstance(created_types, list) else set()
-        )
-        static_set = {t for t in static_types if isinstance(t, str) and t} if isinstance(static_types, list) else set()
-        return None, created_set, static_set, mode_used, True, False, dry_run_err
-    finally:
-        # Always clean up temp file
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except (OSError, PermissionError):
-            # Best-effort cleanup
-            pass
+    # Dev-inspect fallback
+    _tx_out, created, static_created, mode_used = run_tx_sim_via_helper(
+        dev_inspect_bin=sim_bin,
+        rpc_url=rpc_url,
+        sender=sender,
+        mode="dev-inspect",
+        gas_budget=gas_budget,
+        gas_coin=gas_coin,
+        bytecode_package_dir=bytecode_package_dir,
+        ptb_spec=ptb_spec,
+        timeout_s=timeout_s,
+    )
+    return None, created, static_created, mode_used, True, False, dry_run_err
 
 
 def _build_real_agent_prompt(
@@ -1316,7 +865,7 @@ def run(
         pkg_guard_error: str | None = None
         pkg_guard_timed_out = False
         try:
-            _check_run_guards(parent_pid=parent_pid, run_deadline=run_deadline)
+            check_run_guards(parent_pid=parent_pid, run_deadline=run_deadline)
         except TimeoutError as e:
             pkg_guard_error = str(e)
             pkg_guard_timed_out = True
@@ -1366,7 +915,7 @@ def run(
             inventory = {}
             needs_inventory = agent_name in {"baseline-search", "real-openai-compatible", "template-search"}
             if needs_inventory and sender and sender != "0x0":
-                inventory = _fetch_inventory(rpc_url, sender)
+                inventory = fetch_inventory(rpc_url, sender)
 
             ladder = _parse_gas_budget_ladder(gas_budget_ladder)
             budgets = _gas_budgets_to_try(base=gas_budget, ladder=ladder)
@@ -1396,7 +945,7 @@ def run(
             best_score: InhabitationScore | None = None
 
             for plan_i, plan_item in enumerate(plans_to_try):
-                _check_run_guards(parent_pid=parent_pid, run_deadline=run_deadline)
+                check_run_guards(parent_pid=parent_pid, run_deadline=run_deadline)
                 plan_attempts = plan_i + 1
                 remaining = max(0.0, deadline - time.monotonic())
                 if remaining <= 0:
@@ -1464,7 +1013,11 @@ def run(
                 else:
                     ptb_spec_base = {"calls": []}
 
-                variants = _ptb_variants(
+                # Resolve any placeholders ($smi_placeholder) against inventory
+                if agent_name in {"baseline-search", "template-search"}:
+                    resolve_placeholders(ptb_spec_base, inventory)
+
+                variants = ptb_variants(
                     ptb_spec_base,
                     sender=sender,
                     max_variants=max(1, int(max_heuristic_variants)),
@@ -1489,7 +1042,7 @@ def run(
                             formatting_corrections_histogram[k] = formatting_corrections_histogram.get(k, 0) + v
 
                     for sim_i, budget in enumerate(budgets, start=1):
-                        _check_run_guards(parent_pid=parent_pid, run_deadline=run_deadline)
+                        check_run_guards(parent_pid=parent_pid, run_deadline=run_deadline)
                         sim_attempts += 1
                         gas_budget_used = budget
                         remaining = max(0.0, deadline - time.monotonic())

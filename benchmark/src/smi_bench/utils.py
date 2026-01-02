@@ -59,41 +59,31 @@ def validate_binary(path: Path, *, binary_name: str = "binary") -> Path:
 
 def safe_json_loads(text: str, *, context: str = "", max_snippet_len: int = 100) -> Any:
     """
-    Parse JSON with better error messages that include context and snippet.
+    Parse JSON with better error messages and robust recovery from noisy strings.
 
-    Args:
-        text: JSON text to parse.
-        context: Context string for error messages (e.g., "checkpoint file").
-        max_snippet_len: Maximum length of error snippet to include.
-
-    Returns:
-        Parsed JSON object.
-
-    Raises:
-        ValueError: If JSON parsing fails, with context and snippet.
+    Heuristic: If direct parsing fails, it looks for the first/last bracket/brace
+    spans to extract a JSON blob from surrounding prose or logs.
     """
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Retry with robust heuristic: look for last JSON object-like block
-        # This handles cases where helpers print logs to stdout before the JSON.
-        stripped = text.strip()
-        last_brace = stripped.rfind("}")
-        if last_brace != -1:
-            # Find matching opening brace
-            # Simple heuristic: scan backwards for {
-            # This is brittle for nested objects if we just take the first {,
-            # but helpers usually output one top-level object.
-            # Better: try to parse from every { found.
-            for i in range(last_brace):
-                if stripped[i] == "{":
-                    try:
-                        candidate = stripped[i : last_brace + 1]
-                        return json.loads(candidate)
-                    except json.JSONDecodeError:
-                        continue
+        # Robust heuristic: look for JSON object or array blocks
+        # This handles cases where logs/warnings are mixed with JSON.
+        s = text.strip()
+        for opener, closer in (("{", "}"), ("[", "]")):
+            start = s.find(opener)
+            if start == -1:
+                continue
+            end = s.rfind(closer)
+            if end == -1 or end <= start:
+                continue
+            candidate = s[start : end + 1]
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
 
-    # If simple load and heuristic both failed, raise the original error (re-caught)
+    # If simple load and heuristics both failed, raise the original error (re-caught)
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
