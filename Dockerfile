@@ -61,4 +61,7 @@ ENV PATH="/app/benchmark/.venv/bin:${PATH}" \
     SMI_TX_SIM_BIN="/usr/local/bin/smi_tx_sim" \
     SMI_TEMP_DIR="/tmp/smi_bench"
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:9999/health || exit 1
+
 ENTRYPOINT ["smi-a2a-green"]

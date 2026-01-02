@@ -66,6 +66,30 @@ Follows the **Agent-to-Agent (A2A)** pattern used by the AgentBeats platform.
     uv run smi-a2a-smoke --scenario scenario_smi --corpus-root ../sui-packages/packages/mainnet_most_used --samples 1
     ```
 
+### C) Docker Mode (For Production & CI)
+The most robust way to run the benchmark. The container is self-contained (includes Rust binaries) and production-hardened.
+
+1.  **Build the image**:
+    ```bash
+    docker build -t smi-bench .
+    ```
+
+2.  **Run with persistence**:
+    ```bash
+    docker run -d \
+      --env-file .env \
+      -v "$(pwd)/../sui-packages:/app/corpus" \
+      -v "$(pwd)/results:/app/results" \
+      -v "$(pwd)/logs:/app/logs" \
+      -p 9999:9999 \
+      smi-bench
+    ```
+
+3.  **Verify Health**:
+    ```bash
+    curl http://localhost:9999/health
+    ```
+
 ---
 
 ## 3. Multi-Model Benchmarking

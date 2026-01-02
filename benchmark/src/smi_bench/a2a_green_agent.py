@@ -20,7 +20,7 @@ from a2a.types import AgentCapabilities, AgentCard, AgentProvider, AgentSkill, P
 from a2a.utils import new_agent_text_message, new_task
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import JSONResponse, Response
 
 from smi_bench.a2a_errors import A2AError, InvalidConfigError, TaskNotCancelableError
 from smi_bench.schema import Phase2ResultKeys
@@ -615,6 +615,30 @@ def build_app(*, public_url: str) -> Any:
         task_store=InMemoryTaskStore(),
     )
     app = A2AStarletteApplication(agent_card=card, http_handler=handler).build()
+
+    # Add health check endpoint
+    @app.route("/health")
+    async def health(request: Request) -> JSONResponse:
+        from smi_bench.inhabit_runner import _default_dev_inspect_binary
+        from smi_bench.rust import default_rust_binary
+
+        # Check binaries
+        rust_bin = default_rust_binary()
+        sim_bin = _default_dev_inspect_binary()
+
+        status = {
+            "status": "ok",
+            "binaries": {
+                "extractor": {"path": str(rust_bin), "exists": rust_bin.exists()},
+                "simulator": {"path": str(sim_bin), "exists": sim_bin.exists()},
+            },
+        }
+
+        # If binaries are missing, the agent is technically 'unhealthy' for its task
+        if not (rust_bin.exists() and sim_bin.exists()):
+            return JSONResponse(status, status_code=503)
+
+        return JSONResponse(status)
 
     # Add A2A version header middleware
     app.add_middleware(A2AVersionMiddleware)

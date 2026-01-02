@@ -17,12 +17,15 @@ This directory contains the automated benchmarking harness for Sui Move packages
 - **A2A Compliant:** Implements Google's Agent2Agent (A2A) protocol for seamless integration with the AgentBeats platform.
 - **Planning-Focused:** Automatically corrects common JSON formatting errors to measure true planning and reasoning capability.
 - **Multi-Model Support:** Built-in scripts for parallel evaluation of multiple models via OpenRouter.
+- **Robust & Atomic:** Periodic checkpointing ensures zero data loss on crashes, with atomic file writes for state integrity.
+- **Real-time Observability:** High-fidelity event streaming via `stdout` (no file polling) with automated failure mode diagnostics (e.g., categorizing RPC vs. Schema errors).
 
 ## Key Resources
 
 - **[Methodology](../docs/METHODOLOGY.md)** - Detailed scoring rules and extraction logic.
 - **[A2A Compliance](docs/A2A_COMPLIANCE.md)** - Protocol implementation and testing strategy.
 - **[A2A Examples](docs/A2A_EXAMPLES.md)** - Concrete JSON-RPC request/response examples.
+- **[Pipeline Audit](docs/FEEDBACK_PIPELINE_AUDIT.md)** - Detailed analysis of framework hardening.
 - **[Architecture](docs/ARCHITECTURE.md)** - Internal design of the benchmark harness.
 
 ## Quick Command Reference
