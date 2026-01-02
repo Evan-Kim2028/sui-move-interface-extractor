@@ -163,4 +163,3 @@ class TestBackwardCompatibility:
             assert card.capabilities
             assert card.skills
             assert len(card.skills) > 0
-
