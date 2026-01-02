@@ -4,11 +4,12 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
 from smi_bench.json_extract import JsonExtractError, extract_json_value, extract_type_list
+from smi_bench.logging import JsonlLogger
 
 
 @dataclass(frozen=True)
@@ -241,7 +242,7 @@ class RealAgent:
         prompt: str,
         *,
         timeout_s: float | None = None,
-        logger: object | None = None,
+        logger: JsonlLogger | None = None,
         log_context: dict[str, object] | None = None,
     ) -> set[str]:
         url = f"{self.cfg.base_url}/chat/completions"
@@ -420,7 +421,7 @@ class RealAgent:
         prompt: str,
         *,
         timeout_s: float | None = None,
-        logger: object | None = None,
+        logger: JsonlLogger | None = None,
         log_context: dict[str, object] | None = None,
     ) -> dict[str, Any]:
         """
@@ -661,4 +662,4 @@ class RealAgent:
 
         if not isinstance(parsed, dict):
             raise ValueError("expected a JSON object")
-        return parsed
+        return cast(dict[str, Any], parsed)

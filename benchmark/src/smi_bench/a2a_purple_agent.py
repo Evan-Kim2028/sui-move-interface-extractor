@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import Any
+from typing import Any, cast
 
 import uvicorn
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -97,7 +97,7 @@ def build_app(*, public_url: str) -> Any:
     app = A2AStarletteApplication(agent_card=_card(url=public_url), http_handler=handler).build()
 
     # Add A2A version header middleware
-    app.add_middleware(A2AVersionMiddleware)
+    app.add_middleware(cast(Any, A2AVersionMiddleware))
 
     return app
 

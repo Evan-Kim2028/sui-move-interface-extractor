@@ -67,7 +67,7 @@ def _ptb_variants(
     *,
     sender: str,
     max_variants: int,
-) -> list[dict]:
+) -> list[tuple[str, dict[str, Any]]]:
     """Backward-compatible wrapper for tests expecting `_ptb_variants` in this module."""
 
     return ptb_variants(ptb_spec_base, sender=sender, max_variants=max_variants)
@@ -110,7 +110,7 @@ def _run_tx_sim_via_helper(
     ptb_spec: dict[str, Any],
     simulation_mode: str,
     call_timeout_seconds: float,
-) -> tuple[dict[str, Any], set[str], set[str], str]:
+) -> tuple[dict[str, Any] | None, set[str], set[str], str]:
     """Backward-compatible helper for tests/older call sites."""
 
     return run_tx_sim_via_helper(
@@ -118,8 +118,11 @@ def _run_tx_sim_via_helper(
         rpc_url=rpc_url,
         sender=sender,
         ptb_spec=ptb_spec,
-        simulation_mode=simulation_mode,
-        call_timeout_seconds=call_timeout_seconds,
+        mode=simulation_mode,
+        timeout_s=call_timeout_seconds,
+        gas_budget=None,
+        gas_coin=None,
+        bytecode_package_dir=None,
     )
 
 

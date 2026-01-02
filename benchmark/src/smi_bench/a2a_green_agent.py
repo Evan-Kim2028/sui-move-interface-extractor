@@ -9,7 +9,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import uvicorn
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -396,205 +396,205 @@ class SmiBenchGreenExecutor(AgentExecutor):
         if cfg.resume:
             args.append("--resume")
 
-            # Sanitize environment to prevent accidental bleed-through
-            # while preserving essential system paths and SMI configuration.
-            # We must pass enough for 'uv' and the shell to function.
-            allowed_prefixes = (
-                "SMI_",
-                "RUST_",
-                "CARGO_",
-                "PATH",
-                "HOME",
-                "LANG",
-                "LC_",
-                "TERM",
-                "UV_",
-                "PYTHON",
-                "OPENAI_",
-                "OPENROUTER_",
-                "ZAI_",
-                "ZHIPUAI_",
-            )
-            sub_env = {k: v for k, v in os.environ.items() if any(k.startswith(p) for p in allowed_prefixes)}
+        # Sanitize environment to prevent accidental bleed-through
+        # while preserving essential system paths and SMI configuration.
+        # We must pass enough for 'uv' and the shell to function.
+        allowed_prefixes = (
+            "SMI_",
+            "RUST_",
+            "CARGO_",
+            "PATH",
+            "HOME",
+            "LANG",
+            "LC_",
+            "TERM",
+            "UV_",
+            "PYTHON",
+            "OPENAI_",
+            "OPENROUTER_",
+            "ZAI_",
+            "ZHIPUAI_",
+        )
+        sub_env = {k: v for k, v in os.environ.items() if any(k.startswith(p) for p in allowed_prefixes)}
 
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                cwd=str(repo_root),
-                env=sub_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=str(repo_root),
+            env=sub_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
 
-            # Store process for cancellation support
-            self._task_processes[task.id] = proc
+        # Store process for cancellation support
+        self._task_processes[task.id] = proc
 
-            assert proc.stdout is not None
-            proc_lines: collections.deque[str] = collections.deque(maxlen=2000)
+        assert proc.stdout is not None
+        proc_lines: collections.deque[str] = collections.deque(maxlen=2000)
 
-            # Monitor both stdout and cancellation event
-            try:
-                async for b in proc.stdout:
-                    # Check for cancellation
-                    if cancel_event.is_set():
+        # Monitor both stdout and cancellation event
+        try:
+            async for b in proc.stdout:
+                # Check for cancellation
+                if cancel_event.is_set():
+                    await updater.update_status(
+                        TaskState.working,
+                        new_agent_text_message(
+                            "Cancellation requested, terminating process...",
+                            updater.context_id,
+                            updater.task_id,
+                        ),
+                    )
+                    break
+
+                line = b.decode("utf-8", errors="replace").rstrip("\n")
+                if not line:
+                    continue
+
+                if line.startswith("A2A_EVENT:"):
+                    # Structured event - update status
+                    try:
+                        raw_event = line[10:]
+                        evt = safe_json_loads(raw_event, context="A2A event stream")
+                        # Format a nice status message
+                        msg = f"{evt.get('event', 'update')}"
+                        if "package_id" in evt:
+                            msg += f": {evt['package_id']}"
+                        if "error" in evt and evt["error"]:
+                            msg += f" (error: {evt['error']})"
+                        elif "created_hits" in evt:
+                            msg += f" (hits: {evt['created_hits']}/{evt.get('targets')})"
+
                         await updater.update_status(
                             TaskState.working,
-                            new_agent_text_message(
-                                "Cancellation requested, terminating process...",
-                                updater.context_id,
-                                updater.task_id,
-                            ),
+                            new_agent_text_message(msg, updater.context_id, updater.task_id),
                         )
-                        break
+                    except Exception:
+                        pass
+                else:
+                    # Normal log line - buffer for tail report but don't spam status
+                    proc_lines.append(line)
+        except asyncio.CancelledError:
+            # Task was cancelled externally
+            cancel_event.set()
+            raise
 
-                    line = b.decode("utf-8", errors="replace").rstrip("\n")
-                    if not line:
-                        continue
+        # If cancelled, handle graceful termination
+        if cancel_event.is_set():
+            await self._terminate_process(proc, updater)
+            rc = proc.returncode if proc.returncode is not None else -1
+        else:
+            rc = await proc.wait()
 
-                    if line.startswith("A2A_EVENT:"):
-                        # Structured event - update status
-                        try:
-                            raw_event = line[10:]
-                            evt = safe_json_loads(raw_event, context="A2A event stream")
-                            # Format a nice status message
-                            msg = f"{evt.get('event', 'update')}"
-                            if "package_id" in evt:
-                                msg += f": {evt['package_id']}"
-                            if "error" in evt and evt["error"]:
-                                msg += f" (error: {evt['error']})"
-                            elif "created_hits" in evt:
-                                msg += f" (hits: {evt['created_hits']}/{evt.get('targets')})"
+        # Clean up process tracking
+        self._task_processes.pop(task.id, None)
+        self._task_cancel_events.pop(task.id, None)
 
-                            await updater.update_status(
-                                TaskState.working,
-                                new_agent_text_message(msg, updater.context_id, updater.task_id),
-                            )
-                        except Exception:
-                            pass
-                    else:
-                        # Normal log line - buffer for tail report but don't spam status
-                        proc_lines.append(line)
-            except asyncio.CancelledError:
-                # Task was cancelled externally
-                cancel_event.set()
-                raise
+        finished_at = time.time()
 
-            # If cancelled, handle graceful termination
-            if cancel_event.is_set():
-                await self._terminate_process(proc, updater)
-                rc = proc.returncode if proc.returncode is not None else -1
-            else:
-                rc = await proc.wait()
+        # If task was cancelled, update status and return
+        if cancel_event.is_set():
+            await updater.update_status(
+                TaskState.canceled,
+                new_agent_text_message(
+                    f"Task cancelled (exit_code={rc})",
+                    updater.context_id,
+                    updater.task_id,
+                ),
+            )
+            return
 
-            # Clean up process tracking
-            self._task_processes.pop(task.id, None)
-            self._task_cancel_events.pop(task.id, None)
+        metrics: dict[str, Any] = {}
+        errors_list: list[dict[str, Any]] = []
+        if out_json.exists():
+            metrics, errors_list = _summarize_phase2_results(out_json)
 
-            finished_at = time.time()
-
-            # If task was cancelled, update status and return
-            if cancel_event.is_set():
-                await updater.update_status(
-                    TaskState.canceled,
-                    new_agent_text_message(
-                        f"Task cancelled (exit_code={rc})",
-                        updater.context_id,
-                        updater.task_id,
-                    ),
-                )
-                return
-
-            metrics: dict[str, Any] = {}
-            errors_list: list[dict[str, Any]] = []
-            if out_json.exists():
+        # Defensive: if summary unexpectedly returned empty, re-parse from disk.
+        if out_json.exists() and not metrics:
+            parsed = _read_json(out_json)
+            if parsed is not None:
                 metrics, errors_list = _summarize_phase2_results(out_json)
 
-            # Defensive: if summary unexpectedly returned empty, re-parse from disk.
-            if out_json.exists() and not metrics:
-                parsed = _read_json(out_json)
-                if parsed is not None:
-                    metrics, errors_list = _summarize_phase2_results(out_json)
-
-            if out_json.exists() and not metrics:
-                await updater.update_status(
-                    TaskState.working,
-                    new_agent_text_message(
-                        "warning: phase2 results found but summary returned empty metrics",
-                        updater.context_id,
-                        updater.task_id,
-                    ),
-                )
-
-            # If the Phase II output is missing aggregate/package details for any reason,
-            # fall back to deriving errors/metrics from the JSONL logs.
-            if not metrics.get("errors") and run_metadata_path.exists():
-                md = _read_json(run_metadata_path) or {}
-                metrics.setdefault("run_metadata", md)
-
-            # Add high-level failure mode analysis if errors occurred
-            if errors_list:
-                failure_summary = _summarize_failure_modes(errors_list)
-                metrics["failure_modes"] = failure_summary
-
-            bundle = {
-                "schema_version": 1,
-                "spec_url": "smi-bench:evaluation_bundle:v1",
-                "benchmark": "phase2_inhabit",
-                "run_id": run_id,
-                "exit_code": rc,
-                "timings": {
-                    "started_at_unix_seconds": int(started_at),
-                    "finished_at_unix_seconds": int(finished_at),
-                    "elapsed_seconds": finished_at - started_at,
-                },
-                "config": {
-                    "corpus_root": cfg.corpus_root,
-                    "package_ids_file": cfg.package_ids_file,
-                    "samples": cfg.samples,
-                    "rpc_url": cfg.rpc_url,
-                    "simulation_mode": cfg.simulation_mode,
-                    "per_package_timeout_seconds": cfg.per_package_timeout_seconds,
-                    "max_plan_attempts": cfg.max_plan_attempts,
-                    "continue_on_error": cfg.continue_on_error,
-                    "resume": cfg.resume,
-                },
-                "metrics": metrics,
-                "errors": errors_list,
-                "runner_output_tail": "\n".join(list(proc_lines)[-200:]),
-                "artifacts": {
-                    "results_path": str(out_json),
-                    "run_metadata_path": str(run_metadata_path),
-                    "events_path": str(events_path),
-                },
-            }
-
-            await updater.add_artifact(
-                [Part(root=TextPart(text=json.dumps(bundle, sort_keys=True)))],
-                name="evaluation_bundle",
+        if out_json.exists() and not metrics:
+            await updater.update_status(
+                TaskState.working,
+                new_agent_text_message(
+                    "warning: phase2 results found but summary returned empty metrics",
+                    updater.context_id,
+                    updater.task_id,
+                ),
             )
-            if out_json.exists():
-                await updater.add_artifact(
-                    [Part(root=TextPart(text=out_json.read_text(encoding="utf-8")))],
-                    name="phase2_results.json",
-                )
-            if run_metadata_path.exists():
-                await updater.add_artifact(
-                    [Part(root=TextPart(text=run_metadata_path.read_text(encoding="utf-8")))],
-                    name="run_metadata.json",
-                )
 
-            if rc == 0:
-                final_msg = "run_finished"
-                if metrics.get("failure_modes"):
-                    final_msg += f" (failures: {metrics['failure_modes']})"
-                await updater.complete(new_agent_text_message(final_msg, task.context_id, task.id))
-            else:
-                await updater.failed(
-                    new_agent_text_message(
-                        f"phase2 failed (exit={rc})",
-                        updater.context_id,
-                        updater.task_id,
-                    )
+        # If the Phase II output is missing aggregate/package details for any reason,
+        # fall back to deriving errors/metrics from the JSONL logs.
+        if not metrics.get("errors") and run_metadata_path.exists():
+            md = _read_json(run_metadata_path) or {}
+            metrics.setdefault("run_metadata", md)
+
+        # Add high-level failure mode analysis if errors occurred
+        if errors_list:
+            failure_summary = _summarize_failure_modes(errors_list)
+            metrics["failure_modes"] = failure_summary
+
+        bundle = {
+            "schema_version": 1,
+            "spec_url": "smi-bench:evaluation_bundle:v1",
+            "benchmark": "phase2_inhabit",
+            "run_id": run_id,
+            "exit_code": rc,
+            "timings": {
+                "started_at_unix_seconds": int(started_at),
+                "finished_at_unix_seconds": int(finished_at),
+                "elapsed_seconds": finished_at - started_at,
+            },
+            "config": {
+                "corpus_root": cfg.corpus_root,
+                "package_ids_file": cfg.package_ids_file,
+                "samples": cfg.samples,
+                "rpc_url": cfg.rpc_url,
+                "simulation_mode": cfg.simulation_mode,
+                "per_package_timeout_seconds": cfg.per_package_timeout_seconds,
+                "max_plan_attempts": cfg.max_plan_attempts,
+                "continue_on_error": cfg.continue_on_error,
+                "resume": cfg.resume,
+            },
+            "metrics": metrics,
+            "errors": errors_list,
+            "runner_output_tail": "\n".join(list(proc_lines)[-200:]),
+            "artifacts": {
+                "results_path": str(out_json),
+                "run_metadata_path": str(run_metadata_path),
+                "events_path": str(events_path),
+            },
+        }
+
+        await updater.add_artifact(
+            [Part(root=TextPart(text=json.dumps(bundle, sort_keys=True)))],
+            name="evaluation_bundle",
+        )
+        if out_json.exists():
+            await updater.add_artifact(
+                [Part(root=TextPart(text=out_json.read_text(encoding="utf-8")))],
+                name="phase2_results.json",
+            )
+        if run_metadata_path.exists():
+            await updater.add_artifact(
+                [Part(root=TextPart(text=run_metadata_path.read_text(encoding="utf-8")))],
+                name="run_metadata.json",
+            )
+
+        if rc == 0:
+            final_msg = "run_finished"
+            if metrics.get("failure_modes"):
+                final_msg += f" (failures: {metrics['failure_modes']})"
+            await updater.complete(new_agent_text_message(final_msg, task.context_id, task.id))
+        else:
+            await updater.failed(
+                new_agent_text_message(
+                    f"phase2 failed (exit={rc})",
+                    updater.context_id,
+                    updater.task_id,
                 )
+            )
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         """
@@ -707,7 +707,7 @@ def build_app(*, public_url: str) -> Any:
         return JSONResponse(status)
 
     # Add A2A version header middleware
-    app.add_middleware(A2AVersionMiddleware)
+    app.add_middleware(cast(Any, A2AVersionMiddleware))
 
     return app
 

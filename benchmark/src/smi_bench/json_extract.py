@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any, cast
 
 from smi_bench.utils import safe_json_loads
 
@@ -41,7 +42,7 @@ def extract_type_list(text: str) -> set[str]:
     if isinstance(v, list):
         return {x for x in v if isinstance(x, str)}
     if isinstance(v, dict):
-        key_types = v.get("key_types")
+        key_types = cast(dict[Any, Any], v).get("key_types")
         if isinstance(key_types, list):
             return {x for x in key_types if isinstance(x, str)}
     raise JsonExtractError("unexpected JSON shape (expected array or {key_types:[...]})")
