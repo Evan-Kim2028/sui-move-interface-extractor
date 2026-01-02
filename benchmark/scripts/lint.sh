@@ -13,3 +13,9 @@ else
   echo "ruff not installed; skipping ruff check/format"
 fi
 
+if command -v ty >/dev/null 2>&1; then
+  ty check src
+else
+  echo "ty not installed; skipping ty check"
+fi
+

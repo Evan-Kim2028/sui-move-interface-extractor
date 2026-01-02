@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Phase I benchmark runner (key-struct discovery).
 
@@ -16,10 +14,13 @@ Maintainability notes:
 - If you change prompt shaping (e.g., max structs), document it with results; it affects difficulty.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -449,6 +450,8 @@ def _resume_results_from_checkpoint(
     results: list[PackageResult] = []
     seen: set[str] = set()
     errors = cp.aggregate.get("errors") if isinstance(cp.aggregate, dict) else 0
+    if errors is None:
+        errors = 0
     try:
         error_count = int(errors)
     except (ValueError, TypeError):
@@ -613,7 +616,7 @@ def run(
                 "agent": agent_name,
                 "seed": seed,
                 "corpus_root": str(corpus_root),
-                "argv": list(map(str, os.sys.argv)),
+                "argv": list(map(str, sys.argv)),
             }
         )
         logger.event("run_started", started_at_unix_seconds=started, agent=agent_name, seed=seed)

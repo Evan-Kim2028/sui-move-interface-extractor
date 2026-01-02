@@ -352,7 +352,7 @@ class RealAgent:
                 break
             except Exception as e:
                 last_exc = e
-                if logger is not None:
+                if (l := logger) is not None:
                     ctx = dict(log_context or {})
                     ctx.update(
                         {
@@ -368,7 +368,7 @@ class RealAgent:
                             "exc": str(e),
                         }
                     )
-                    logger.event("llm_request_error", **ctx)
+                    l.event("llm_request_error", **ctx)
                 sleep_s = backoff_s
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
@@ -578,7 +578,7 @@ class RealAgent:
             except Exception as e:
                 raise ValueError(f"unexpected response shape: {data}") from e
 
-        if logger is not None:
+        if (l := logger) is not None:
             ctx = dict(log_context or {})
             ctx.update(
                 {
@@ -589,7 +589,7 @@ class RealAgent:
                     "content": content,
                 }
             )
-            logger.event("llm_response", **ctx)
+            l.event("llm_response", **ctx)
 
         if not isinstance(content, str):
             raise ValueError("unexpected response content type")
@@ -607,7 +607,7 @@ class RealAgent:
         try:
             parsed = json.loads(content)
         except Exception as e:
-            if logger is not None:
+            if (l := logger) is not None:
                 ctx = dict(log_context or {})
                 ctx.update(
                     {
@@ -620,10 +620,10 @@ class RealAgent:
                         "content": content,
                     }
                 )
-                logger.event("llm_json_parse_error", **ctx)
+                l.event("llm_json_parse_error", **ctx)
             raise
 
-        if logger is not None:
+        if (l := logger) is not None:
             ctx = dict(log_context or {})
             ctx.update(
                 {
@@ -634,7 +634,7 @@ class RealAgent:
                     "parsed": parsed,
                 }
             )
-            logger.event("llm_json_parsed", **ctx)
+            l.event("llm_json_parsed", **ctx)
 
         if not isinstance(parsed, dict):
             raise ValueError("expected a JSON object")

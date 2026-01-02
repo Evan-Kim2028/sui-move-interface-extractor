@@ -8,7 +8,6 @@ import os
 import stat
 import time
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import Any
 
 

@@ -6,7 +6,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from smi_bench.utils import BinaryNotFoundError, BinaryNotExecutableError, safe_json_loads, validate_binary
+from smi_bench.utils import BinaryNotExecutableError, BinaryNotFoundError, safe_json_loads, validate_binary
 
 # Re-export for convenience
 __all__ = ["default_rust_binary", "validate_rust_binary", "emit_bytecode_json", "BinaryNotFoundError", "BinaryNotExecutableError"]

@@ -70,6 +70,121 @@ Both Phase I and Phase II consume a local `sui-packages` checkout (bytecode corp
 - `smi_bench/logging.py`
   - JSONL logging for runs (run metadata + event stream + per-package rows).
 
+## A2A Layer
+
+### Overview
+The A2A layer wraps the benchmark harness in a standardized AgentBeats-compatible protocol.
+It provides: streaming execution, artifact encapsulation, and scenario lifecycle management.
+
+### Components
+
+- `smi_bench/a2a_green_agent.py` - Green agent (Phase II runner)
+  - `SmiBenchGreenExecutor`: Implements AgentExecutor interface
+  - Spawns `smi-inhabit` subprocesses
+  - Streams live events via TaskUpdater
+  - Returns `evaluation_bundle` artifact
+  - Tailors `evaluation_bundle` from Phase II output JSON
+
+- `smi_bench/a2a_purple_agent.py` - Purple agent (stub)
+  - `PurpleExecutor`: Echo/test harness
+  - Validates A2A wiring without LLM costs
+
+- `smi_bench/a2a_smoke.py` - Smoke test client
+  - Starts scenario (optional)
+  - Waits for green agent health
+  - Sends minimal config
+  - Extracts and prints summary
+
+- `smi_bench/a2a_preflight.py` - Pre-flight validator
+  - Checks corpus existence
+  - Validates RPC reachability
+  - Verifies Rust binary availability
+  - Runs smoke test automatically
+
+- `smi_bench/a2a_validate_bundle.py` - Schema validator
+  - Validates `evaluation_bundle` against JSON Schema
+  - Checks required fields and `spec_url`
+  - Used in CI for A2A artifacts
+
+- `smi_bench/agentbeats_run_scenario.py` - Scenario manager
+  - Wraps AgentBeats ScenarioManager
+  - Patches agent commands to launch local servers
+  - Manages scenario lifecycle (--status, --kill)
+  - Handles .env propagation to subprocesses
+
+### A2A Protocol Flow
+
+```
+1. Orchestrator → GreenAgent: POST /rpc (JSON-RPC message/send)
+2. GreenAgent → TaskStore: Create task, enqueue event
+3. GreenAgent → SmiBenchGreenExecutor.execute(): Spawn smi-inhabit
+4. SmiBenchGreenExecutor → subprocess: uv run smi-inhabit [...args...]
+5. subprocess → stdout/stderr: Tail events → TaskUpdater.update_status()
+6. subprocess → exit code: TaskUpdater.complete() or failed()
+7. GreenAgent → response: Return with evaluation_bundle artifact
+8. Orchestrator → parse: Extract metrics, errors, artifacts
+```
+
+### Event Streaming Mechanism
+
+Events flow through: `subprocess.stdout` → `SmiBenchGreenExecutor` → `TaskUpdater` → `EventQueue` → A2A client
+
+Event types:
+- `status`: Task state transitions (working/completed/failed)
+- `artifact`: Evaluation bundle, Phase II results, logs
+- `error`: Execution failures
+
+See `docs/A2A_EXAMPLES.md` for event field definitions and examples.
+
+### Evaluation Bundle Schema
+
+Path: `benchmark/docs/evaluation_bundle.schema.json`
+
+Required fields (v1):
+- `schema_version`: Always 1
+- `spec_url`: `smi-bench:evaluation_bundle:v1`
+- `benchmark`: `"phase2_inhabit"`
+- `run_id`: Unique identifier (ISO timestamp-based)
+- `exit_code`: Process exit code (0=success)
+- `timings`: `started_at`, `finished_at`, `elapsed_seconds`
+- `config`: Full Phase II configuration
+- `metrics`: Aggregated results (`avg_hit_rate`, `packages_total`, etc.)
+- `errors`: List of package-level errors
+- `artifacts`: Paths to `results_path`, `run_metadata_path`, `events_path`
+
+Invariants:
+- `exit_code=0` ⇔ Task state = completed
+- `metrics` may be empty if Phase II output is missing
+- `artifacts` paths must be absolute or relative to scenario root
+- `spec_url` must match schema `$id`
+
+### Scenario Lifecycle
+
+1. Start: `smi-agentbeats-scenario scenario_smi --launch-mode current`
+   - Writes PID to `scenario_smi/.scenario_pids.json`
+   - Spawns green (9999) + purple (9998) processes
+   - Loads env vars from `.env` into subprocesses
+
+2. Monitor: `smi-agentbeats-scenario scenario_smi --status`
+   - Checks ports 9999/9998
+   - Prints `green_9999_listening=True/False`
+   - Prints `purple_9998_listening=True/False`
+
+3. Stop: `smi-agentbeats-scenario scenario_smi --kill`
+   - Reads PID from `scenario_smi/.scenario_pids.json`
+   - Sends SIGTERM to scenario manager
+   - Manager should terminate child processes
+   - Best-effort (may leave zombie processes if manager crashed)
+
+### Integration Points
+
+- `scenario_smi/green_agent_card.toml`: Green agent A2A metadata
+- `scenario_smi/purple_agent_card.toml`: Purple agent A2A metadata
+- `scenario_smi/scenario.toml`: Scenario configuration (ports, commands)
+- `.env`: API keys for agent subprocesses (SMI_API_KEY, OPENROUTER_API_KEY)
+
+See `benchmark/A2A_GETTING_STARTED.md` for usage examples and `docs/A2A_EXAMPLES.md` for protocol details.
+
 ## Output schemas / versioning invariants
 
 - Phase I output JSON includes `schema_version=1` (see `runner.py`).

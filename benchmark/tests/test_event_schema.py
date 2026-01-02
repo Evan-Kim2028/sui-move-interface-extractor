@@ -19,7 +19,6 @@ import pytest
 
 from smi_bench.logging import JsonlLogger
 
-
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 # Required fields for all events

@@ -37,7 +37,9 @@ def main(argv: list[str] | None = None) -> None:
     pid_file = scenario_root / ".scenario_pids.json"
 
     if args.status:
+        import shutil
         import socket
+        import subprocess
 
         def is_listening(host: str, port: int) -> bool:
             try:
@@ -46,11 +48,30 @@ def main(argv: list[str] | None = None) -> None:
             except Exception:
                 return False
 
+        def get_pid_on_port(port: int) -> str | None:
+            if not shutil.which("lsof"):
+                return "unknown (lsof missing)"
+            try:
+                res = subprocess.check_output(["lsof", "-t", f"-i:{port}"], stderr=subprocess.DEVNULL)
+                return res.decode().strip().replace("\n", ", ")
+            except Exception:
+                return None
+
         # Default ports for scenario_smi
-        green_ok = is_listening("127.0.0.1", 9999)
-        purple_ok = is_listening("127.0.0.1", 9998)
-        print(f"green_9999_listening={green_ok}")
-        print(f"purple_9998_listening={purple_ok}")
+        for name, port in [("green", 9999), ("purple", 9998)]:
+            listening = is_listening("127.0.0.1", port)
+            pid = get_pid_on_port(port) if listening else "N/A"
+            print(f"{name}_port_{port}_listening={listening} pid={pid}")
+
+        # Check credentials
+        env_path = args.env_file
+        print(f"env_file={env_path} exists={env_path.exists()}")
+        if env_path.exists():
+            env = load_dotenv(env_path)
+            for key in ["OPENROUTER_API_KEY", "SMI_API_KEY"]:
+                val = env.get(key)
+                masked = f"{val[:6]}...{val[-4:]}" if val and len(val) > 10 else ("set" if val else "MISSING")
+                print(f"credential_{key}={masked}")
         return
 
     if args.kill:
@@ -60,7 +81,9 @@ def main(argv: list[str] | None = None) -> None:
 
         import json
         import os
+        import shutil
         import signal
+        import subprocess
 
         try:
             data = json.loads(pid_file.read_text(encoding="utf-8"))
@@ -73,9 +96,27 @@ def main(argv: list[str] | None = None) -> None:
         pids = [data.get("scenario_manager_pid")]
         for pid in [p for p in pids if isinstance(p, int) and p > 0]:
             try:
+                print(f"terminating_pid={pid}")
                 os.kill(pid, signal.SIGTERM)
-            except Exception:
-                pass
+            except ProcessLookupError:
+                print(f"pid_not_found={pid}")
+            except Exception as e:
+                print(f"kill_error={e}")
+        
+        # Best-effort: also kill anything on the default ports if we are on a system with lsof
+        if shutil.which("lsof"):
+            for port in [9999, 9998]:
+                try:
+                    pids_on_port = subprocess.check_output(["lsof", "-t", f"-i:{port}"], stderr=subprocess.DEVNULL).decode().strip().split("\n")
+                    for p in pids_on_port:
+                        if p:
+                            print(f"terminating_port_process={p}_on_{port}")
+                            os.kill(int(p), signal.SIGTERM)
+                except Exception:
+                    pass
+
+        if pid_file.exists():
+            pid_file.unlink()
         return
 
     # The upstream `agentbeats load_scenario` CLI resolves scenario_root relative to its

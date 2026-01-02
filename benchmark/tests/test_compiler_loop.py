@@ -4,8 +4,6 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from smi_bench.inhabit_runner import _build_real_agent_retry_prompt, run
 
 

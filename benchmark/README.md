@@ -264,6 +264,8 @@ Practical guidance:
 - Methodology: `docs/METHODOLOGY.md`
 - Schema: `docs/SCHEMA.md`
 - Operations / runbook: `docs/RUNBOOK.md`
+- A2A Exchanges: `docs/A2A_EXCHANGES.md`
+- Troubleshooting: `docs/TROUBLESHOOTING.md`
 - Standard manifests: `manifests/README.md`
 
 ## AgentBeats / A2A (Local Scenario)

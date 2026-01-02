@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 
 from smi_bench.utils import safe_json_loads

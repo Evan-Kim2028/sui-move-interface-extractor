@@ -1,4 +1,4 @@
-"""Schema definitions and validators for Phase I/II run JSON outputs.
+"""Schema types and validators.
 
 This module provides TypedDict definitions and validation functions to ensure
 schema stability and catch accidental breakage during refactors.
@@ -7,7 +7,6 @@ schema stability and catch accidental breakage during refactors.
 from __future__ import annotations
 
 from typing import Any, TypedDict
-
 
 # Phase I Schema Definitions
 

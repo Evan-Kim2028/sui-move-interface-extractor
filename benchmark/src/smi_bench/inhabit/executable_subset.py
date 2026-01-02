@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Deterministic Phase II helper logic (baseline-search + interface summaries).
 
@@ -13,6 +11,8 @@ Refactor invariants:
 - Keep arg construction rules in sync with what `smi_tx_sim` supports.
 - Avoid deep recursion or unbounded search; this is a baseline + substrate, not a solver.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 
@@ -161,15 +161,17 @@ def _is_sui_type(t: dict) -> bool:
 
 
 def _is_coin_sui_type(t: dict) -> bool:
+    if not isinstance(t, dict):
+        return False
+    type_args = t.get("type_args")
     return (
-        isinstance(t, dict)
-        and t.get("kind") == "datatype"
+        t.get("kind") == "datatype"
         and t.get("address") == SUI_FRAMEWORK_ADDRESS
         and t.get("module") == COIN_MODULE
         and t.get("name") == COIN_STRUCT
-        and isinstance(t.get("type_args"), list)
-        and len(t.get("type_args")) == 1
-        and _is_sui_type(t.get("type_args")[0])
+        and isinstance(type_args, list)
+        and len(type_args) == 1
+        and _is_sui_type(type_args[0])
     )
 
 

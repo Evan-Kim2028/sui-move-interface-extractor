@@ -18,6 +18,10 @@ def _default_request(
     rpc_url: str,
     simulation_mode: str,
     sender: str | None,
+    max_plan_attempts: int,
+    max_planning_calls: int | None,
+    continue_on_error: bool,
+    resume: bool,
 ) -> dict[str, Any]:
     cfg: dict[str, Any] = {
         "corpus_root": corpus_root,
@@ -26,10 +30,12 @@ def _default_request(
         "rpc_url": rpc_url,
         "simulation_mode": simulation_mode,
         "per_package_timeout_seconds": timeout_s,
-        "max_plan_attempts": 2,
-        "continue_on_error": True,
-        "resume": False,
+        "max_plan_attempts": max(1, int(max_plan_attempts)),
+        "continue_on_error": bool(continue_on_error),
+        "resume": bool(resume),
     }
+    if max_planning_calls is not None:
+        cfg["max_planning_calls"] = max(1, int(max_planning_calls))
     if sender:
         cfg["sender"] = sender
     return {
@@ -85,6 +91,28 @@ def main(argv: list[str] | None = None) -> None:
         help="Optional sender address (public). Only needed for some simulation modes.",
     )
     p.add_argument("--per-package-timeout-seconds", type=float, default=90)
+    p.add_argument(
+        "--max-plan-attempts",
+        type=int,
+        default=2,
+        help="Max PTB replanning attempts per package.",
+    )
+    p.add_argument(
+        "--max-planning-calls",
+        type=int,
+        default=None,
+        help="Maximum progressive-exposure planning calls per package (omit to use default).",
+    )
+    p.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Continue even if a package fails.",
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an existing output bundle (if supported by server).",
+    )
     p.add_argument("--out-response", type=Path, default=Path("results/a2a_smoke_response.json"))
     args = p.parse_args(argv)
 
@@ -136,6 +164,10 @@ def main(argv: list[str] | None = None) -> None:
             rpc_url=args.rpc_url,
             simulation_mode=args.simulation_mode,
             sender=args.sender,
+            max_plan_attempts=args.max_plan_attempts,
+            max_planning_calls=args.max_planning_calls,
+            continue_on_error=args.continue_on_error,
+            resume=args.resume,
         )
         with httpx.Client(timeout=None) as client:
             r = client.post(args.green_url, json=req)

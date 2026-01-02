@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import json
-import tempfile
 from pathlib import Path
 
 import pytest
 
 from smi_bench.utils import (
     BinaryNotFoundError,
-    BinaryNotExecutableError,
     cleanup_old_temp_files,
     compute_json_checksum,
     ensure_temp_dir,

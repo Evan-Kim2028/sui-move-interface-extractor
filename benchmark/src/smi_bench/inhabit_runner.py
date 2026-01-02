@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Phase II benchmark runner (type inhabitation).
 
@@ -17,11 +15,14 @@ Maintainability notes:
 - For “official” evals, prefer `--simulation-mode dry-run --require-dry-run` to avoid weaker fallbacks.
 """
 
+from __future__ import annotations
+
 import argparse
 import copy
 import json
 import os
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -729,13 +730,13 @@ def _run_tx_sim_with_fallback(
         if bytecode_package_dir is not None:
             cmd += ["--bytecode-package-dir", str(bytecode_package_dir)]
         out = subprocess.check_output(cmd, text=True, timeout=timeout_s)
-        data = safe_json_loads(out, context=f"tx sim helper output ({mode})")
+        data = safe_json_loads(out, context="tx sim helper output (dev-inspect fallback)")
         if not isinstance(data, dict):
             raise RuntimeError(
-                f"Tx sim helper returned non-object JSON\n"
+                "Tx sim helper returned non-object JSON\n"
                 f"  Expected dict, got {type(data).__name__}\n"
-                f"  Mode: {mode}\n"
-                f"  The helper output format may have changed."
+                "  Mode: dev-inspect\n"
+                "  The helper output format may have changed."
             )
         mode_used = data.get("modeUsed") if isinstance(data.get("modeUsed"), str) else "unknown"
         created_types = data.get("createdObjectTypes")
@@ -750,10 +751,8 @@ def _run_tx_sim_with_fallback(
         try:
             if tmp_path.exists():
                 tmp_path.unlink()
-        except (OSError, PermissionError) as e:
-            # Best-effort cleanup; log but don't fail
-            if logger is not None:
-                logger.event("temp_file_cleanup_failed", path=str(tmp_path), error=str(e))
+        except (OSError, PermissionError):
+            # Best-effort cleanup
             pass
 
 
@@ -1215,7 +1214,7 @@ def run(
                 "max_heuristic_variants": max_heuristic_variants,
                 "parent_pid": parent_pid,
                 "max_run_seconds": max_run_seconds,
-                "argv": list(map(str, os.sys.argv)),
+                "argv": list(map(str, sys.argv)),
             }
         )
         logger.event(
@@ -1895,14 +1894,14 @@ def run(
         semantic_failure_attempts = 0
     max_hit_rate = max(hit_rates) if hit_rates else 0.0
     schema_violation_count = sum(int(r.schema_violation_count or 0) for r in results)
-    schema_violation_attempts_until_first_valid = [
+    schema_violation_attempts_until_first_valid_list = [
         int(v)
         for r in results
         if (v := r.schema_violation_attempts_until_first_valid) is not None and (r.schema_violation_count or 0) > 0
     ]
 
     semantic_failure_count = sum(int(r.semantic_failure_count or 0) for r in results)
-    semantic_failure_attempts_until_first_success = [
+    semantic_failure_attempts_until_first_success_list = [
         int(v) for r in results if (v := r.semantic_failure_attempts_until_first_success) is not None
     ]
 
@@ -1924,12 +1923,12 @@ def run(
             "schema_violation_rate": schema_violation_rate,
             "schema_violation_attempts": schema_violation_attempts,
             "schema_violation_count": schema_violation_count,
-            "schema_violation_attempts_until_first_valid": schema_violation_attempts_until_first_valid,
+            "schema_violation_attempts_until_first_valid": schema_violation_attempts_until_first_valid_list,
             "errors": error_count,
             "semantic_failure_rate": semantic_failure_rate,
             "semantic_failure_attempts": semantic_failure_attempts,
             "semantic_failure_count": semantic_failure_count,
-            "semantic_failure_attempts_until_first_success": semantic_failure_attempts_until_first_success,
+            "semantic_failure_attempts_until_first_success": semantic_failure_attempts_until_first_success_list,
         },
         packages=[
             {

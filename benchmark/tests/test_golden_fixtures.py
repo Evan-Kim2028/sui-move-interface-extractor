@@ -17,15 +17,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
-from smi_bench.inhabit.score import InhabitationScore
-from smi_bench.judge import KeyTypeScore
+from smi_bench.inhabit_runner import InhabitRunResult
+from smi_bench.inhabit_runner import _load_checkpoint as _load_inhabit_checkpoint
 from smi_bench.runner import RunResult, _load_checkpoint
-from smi_bench.inhabit_runner import InhabitRunResult, _load_checkpoint as _load_inhabit_checkpoint
 from smi_bench.schema import validate_phase1_run_json, validate_phase2_run_json
 from smi_bench.utils import compute_json_checksum, safe_json_loads
-
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 

@@ -13,18 +13,14 @@ This prevents "resume broke in refactor" regressions.
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
 
+from smi_bench.inhabit_runner import InhabitRunResult
+from smi_bench.inhabit_runner import _load_checkpoint as _load_inhabit_checkpoint
 from smi_bench.runner import RunResult, _load_checkpoint, _write_checkpoint
-from smi_bench.inhabit_runner import InhabitRunResult, _load_checkpoint as _load_inhabit_checkpoint, _write_checkpoint as _write_inhabit_checkpoint
-from smi_bench.judge import KeyTypeScore
-from smi_bench.inhabit.score import InhabitationScore
-from smi_bench.schema import validate_phase1_run_json, validate_phase2_run_json
 from smi_bench.utils import compute_json_checksum
-
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -57,7 +53,6 @@ def test_checkpoint_with_bad_checksum_raises_error(tmp_path: Path) -> None:
 
 def test_checkpoint_with_valid_checksum_loads_successfully(tmp_path: Path) -> None:
     """Test that checkpoints with valid checksum load successfully."""
-    from smi_bench.runner import PackageResult
 
     # Create a minimal valid checkpoint
     result = RunResult(
@@ -156,7 +151,6 @@ def test_checkpoint_resume_skips_malformed_packages(tmp_path: Path) -> None:
 
 def test_checkpoint_checksum_is_computed_correctly(tmp_path: Path) -> None:
     """Test that checkpoint checksum computation is deterministic and correct."""
-    from smi_bench.runner import PackageResult
 
     result = RunResult(
         schema_version=1,
@@ -187,7 +181,6 @@ def test_checkpoint_checksum_is_computed_correctly(tmp_path: Path) -> None:
 
 def test_phase2_checkpoint_without_checksum_loads_successfully(tmp_path: Path) -> None:
     """Test Phase II checkpoint without checksum loads (backward compatibility)."""
-    from smi_bench.inhabit_runner import InhabitPackageResult
 
     # Create minimal Phase II checkpoint without checksum
     checkpoint_data = {

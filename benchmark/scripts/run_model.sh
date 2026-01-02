@@ -192,12 +192,14 @@ if [ "$MODE" = "a2a" ]; then
     SMI_API_BASE_URL="https://openrouter.ai/api/v1" \
     uv run smi-a2a-smoke \
         --env-file "$ENV_FILE" \
-        --parent-pid "$$" \
         --scenario "$SCENARIO" \
         --corpus-root "$CORPUS_ROOT" \
         --package-ids-file "$MANIFEST_OUT" \
         --samples "$RUN_SAMPLES" \
         --per-package-timeout-seconds "$PER_PKG_TIMEOUT" \
+        --max-plan-attempts "$MAX_PLAN_ATTEMPTS" \
+        --max-planning-calls 50 \
+        --continue-on-error \
         --rpc-url "$RPC_URL" \
         --out-response "$RESPONSE_OUT" \
         > "$SMOKE_LOG" 2>&1
