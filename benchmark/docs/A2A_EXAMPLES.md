@@ -28,6 +28,7 @@ uv run smi-a2a-validate-bundle results/a2a_smoke_response.json
 The scenario manager launches both agents (green and purple):
 
 ```bash
+cd benchmark
 uv run smi-agentbeats-scenario scenario_smi --launch-mode current
 ```
 
@@ -52,7 +53,7 @@ The `smi-a2a-smoke` tool constructs a JSON-RPC request:
       "role": "user",
       "parts": [
         {
-          "text": "{\"config\": {\"corpus_root\": \"/Users/evandekim/Documents/learning_move/packages/sui-packages/packages/mainnet_most_used\", \"package_ids_file\": \"manifests/standard_phase2_no_framework.txt\", \"samples\": 1, \"rpc_url\": \"https://fullnode.mainnet.sui.io:443\", \"simulation_mode\": \"dry-run\", \"per_package_timeout_seconds\": 90, \"max_plan_attempts\": 2, \"continue_on_error\": true, \"resume\": false }}"
+          "text": "{\"config\": {\"corpus_root\": \"<CORPUS_ROOT>\", \"package_ids_file\": \"manifests/standard_phase2_no_framework.txt\", \"samples\": 1, \"rpc_url\": \"https://fullnode.mainnet.sui.io:443\", \"simulation_mode\": \"dry-run\", \"per_package_timeout_seconds\": 90, \"max_plan_attempts\": 2, \"continue_on_error\": true, \"resume\": false }}"
         }
       ]
     }
@@ -74,7 +75,7 @@ The `smi-a2a-smoke` tool constructs a JSON-RPC request:
 **Config JSON structure:**
 ```json
 {
-  "corpus_root": "/path/to/sui-packages/packages/mainnet_most_used",
+  "corpus_root": "<CORPUS_ROOT>",
   "package_ids_file": "manifests/standard_phase2_no_framework.txt",
   "samples": 1,
   "rpc_url": "https://fullnode.mainnet.sui.io:443",
@@ -149,7 +150,7 @@ The `evaluation_bundle` artifact contains the most important summary:
   },
   "config": {
     "continue_on_error": true,
-    "corpus_root": "/Users/evandekim/Documents/learning_move/packages/sui-packages/packages/mainnet_most_used",
+    "corpus_root": "<CORPUS_ROOT>",
     "max_plan_attempts": 2,
     "package_ids_file": "manifests/standard_phase2_no_framework.txt",
     "per_package_timeout_seconds": 90.0,
@@ -213,6 +214,7 @@ valid
 **Use case:** Quick health check and protocol validation
 
 ```bash
+cd benchmark
 uv run smi-a2a-smoke \
   --corpus-root <CORPUS_ROOT> \
   --package-ids-file manifests/standard_phase2_no_framework.txt \
@@ -321,6 +323,8 @@ For a successful single-package run:
 ### Parsing Events Programmatically
 
 ```bash
+cd benchmark
+
 # Count packages processed
 grep "event.*package_finished" logs/a2a_phase2_*/events.jsonl | wc -l
 
@@ -357,6 +361,7 @@ uv run python scripts/phase2_analyze.py results/a2a/<run_id>.json
 **Scenario:** Continue processing even if some packages fail
 
 ```bash
+cd benchmark
 uv run smi-a2a-smoke \
   --corpus-root <CORPUS_ROOT> \
   --package-ids-file manifests/standard_phase2_no_framework.txt \
@@ -377,6 +382,8 @@ uv run smi-a2a-smoke \
 **Scenario:** Shorter timeout for known-fast packages, longer for complex ones
 
 ```bash
+cd benchmark
+
 # Fast packages (simple protocols)
 uv run smi-a2a-smoke \
   --corpus-root <CORPUS_ROOT> \
@@ -398,6 +405,7 @@ uv run smi-a2a-smoke \
 
 1. Create one-line manifest:
 ```bash
+cd benchmark
 printf "%s\n" 0x00db9a10bb9536ab367b7d1ffa404c1d6c55f009076df1139dc108dd86608bbe > debug_one_pkg.txt
 ```
 
@@ -454,6 +462,7 @@ cat logs/a2a_phase2_1767323740/events.jsonl | grep "error" | jq
 
 **Step 1:** Run a known-good package:
 ```bash
+cd benchmark
 printf "%s\n" <SIMPLE_PACKAGE_ID> > good_pkg.txt
 uv run smi-a2a-smoke --package-ids-file good_pkg.txt
 ```
@@ -485,6 +494,7 @@ cp results/a2a_smoke_response.json results/known_good_response.json
 
 **Step 3:** Re-run the same request:
 ```bash
+cd benchmark
 uv run smi-a2a-smoke --corpus-root <CORPUS_ROOT> --samples 1
 ```
 
@@ -509,6 +519,6 @@ jq '.result.artifacts[0].parts[0].text | fromjson | .metrics' results/a2a_smoke_
 
 ## Related Documentation
 
-- [A2A_GETTING_STARTED.md](../A2A_GETTING_STARTED.md) - Quick start guide
+- [GETTING_STARTED.md](../GETTING_STARTED.md) - Quick start guide
 - [ARCHITECTURE.md](ARCHITECTURE.md) - A2A Layer design details
 - [evaluation_bundle.schema.json](evaluation_bundle.schema.json) - Full schema definition

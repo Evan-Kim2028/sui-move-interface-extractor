@@ -24,6 +24,7 @@ def load_pyproject_toml(path: Path) -> Dict[str, str]:
     """Load pyproject.toml and extract script names."""
     try:
         import tomllib
+
         with open(path, "rb") as f:
             data = tomllib.load(f)
         scripts = data.get("project", {}).get("scripts", {})
@@ -124,11 +125,7 @@ def path_exists(path_str: str, doc_root: Path) -> bool:
 
 
 def validate_code_block(
-    line_num: int,
-    lang: str,
-    code: str,
-    available_scripts: Dict[str, str],
-    doc_root: Path
+    line_num: int, lang: str, code: str, available_scripts: Dict[str, str], doc_root: Path
 ) -> List[str]:
     """
     Validate a single code block.
@@ -185,11 +182,7 @@ def validate_code_block(
     return errors
 
 
-def validate_markdown_file(
-    md_path: Path,
-    pyproject: Path,
-    doc_root: Path
-) -> Tuple[List[str], List[str]]:
+def validate_markdown_file(md_path: Path, pyproject: Path, doc_root: Path) -> Tuple[List[str], List[str]]:
     """
     Validate all code blocks in a Markdown file.
 
@@ -234,7 +227,7 @@ def main(argv: List[str] | None = None) -> int:
     # Default to A2A-related docs
     if not args.files:
         args.files = [
-            Path("benchmark/A2A_GETTING_STARTED.md"),
+            Path("benchmark/GETTING_STARTED.md"),
             Path("benchmark/docs/A2A_EXAMPLES.md"),
             Path("benchmark/README.md"),
         ]

@@ -2,41 +2,37 @@
 
 This directory contains the automated benchmarking harness for Sui Move packages.
 
-## Phase Overview
+## Start here
+
+- **Run Phase II quickly:** `GETTING_STARTED.md`
+- **Single model runner:** `scripts/run_model.sh`
+- **Multi-model runner:** `scripts/run_multi_model.sh`
+- **A2A integration:** `docs/A2A_EXAMPLES.md`
+
+## Phase overview
 
 - **Phase I (Key-Struct Discovery):** Predict which structs in a package have the `key` ability based on field shapes.
 - **Phase II (Type Inhabitation):** Plan valid transaction sequences (Programmable Transaction Blocks) to create target Move objects.
 
-## 🚀 Getting Started
+## Key resources
 
-> **[GETTING_STARTED.md](./GETTING_STARTED.md)** — Start here for installation, API setup, and running your first benchmark.
+- `../docs/METHODOLOGY.md` - Detailed scoring rules and extraction logic.
+- `docs/A2A_COMPLIANCE.md` - Protocol implementation and testing strategy.
+- `docs/A2A_EXAMPLES.md` - Concrete JSON-RPC request/response examples.
+- `docs/FEEDBACK_PIPELINE_AUDIT.md` - Framework hardening notes.
+- `docs/ARCHITECTURE.md` - Maintainers’ map of the harness internals.
 
-## Benchmark Features
-
-- **Bytecode-First:** All ground truth is derived from compiled Move bytecode, ensuring accuracy even for private constructors.
-- **A2A Compliant:** Implements Google's Agent2Agent (A2A) protocol for seamless integration with the AgentBeats platform.
-- **Planning-Focused:** Automatically corrects common JSON formatting errors to measure true planning and reasoning capability.
-- **Multi-Model Support:** Built-in scripts for parallel evaluation of multiple models via OpenRouter.
-- **Robust & Atomic:** Periodic checkpointing ensures zero data loss on crashes, with atomic file writes for state integrity.
-- **Real-time Observability:** High-fidelity event streaming via `stdout` (no file polling) with automated failure mode diagnostics (e.g., categorizing RPC vs. Schema errors).
-
-## Key Resources
-
-- **[Methodology](../docs/METHODOLOGY.md)** - Detailed scoring rules and extraction logic.
-- **[A2A Compliance](docs/A2A_COMPLIANCE.md)** - Protocol implementation and testing strategy.
-- **[A2A Examples](docs/A2A_EXAMPLES.md)** - Concrete JSON-RPC request/response examples.
-- **[Pipeline Audit](docs/FEEDBACK_PIPELINE_AUDIT.md)** - Detailed analysis of framework hardening.
-- **[Architecture](docs/ARCHITECTURE.md)** - Internal design of the benchmark harness.
-
-## Quick Command Reference
+## Quick command reference
 
 ```bash
-# Run local A2A scenario
+# Single-model Phase II targeted
+cd benchmark
+./scripts/run_model.sh --env-file ./.env --model openai/gpt-5.2
+
+# Multi-model Phase II targeted (start conservative to avoid RPC rate limits)
+./scripts/run_multi_model.sh --env-file ./.env --models "openai/gpt-5.2,google/gemini-3-flash-preview" --parallel 1
+
+# Local A2A scenario
 uv run smi-agentbeats-scenario scenario_smi --launch-mode current
-
-# Run smoke test
 uv run smi-a2a-smoke --corpus-root ../sui-packages/packages/mainnet_most_used --samples 1
-
-# View results
-python scripts/phase2_status.py results/my_run.json
 ```

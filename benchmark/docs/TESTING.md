@@ -136,7 +136,7 @@ jobs:
       - name: Validate cross-references
         run: |
           python benchmark/scripts/validate_crossrefs.py \
-            benchmark/A2A_GETTING_STARTED.md \
+            benchmark/GETTING_STARTED.md \
             benchmark/docs/A2A_EXAMPLES.md \
             benchmark/docs/ARCHITECTURE.md
 
@@ -199,7 +199,7 @@ Before merging any doc changes, verify:
 python benchmark/scripts/test_doc_examples.py
 
 # Test specific file
-python benchmark/scripts/test_doc_examples.py benchmark/A2A_GETTING_STARTED.md
+python benchmark/scripts/test_doc_examples.py benchmark/GETTING_STARTED.md
 
 # Skip external checks for CI
 python benchmark/scripts/test_doc_examples.py --skip-external
@@ -225,7 +225,7 @@ python benchmark/scripts/test_doc_examples.py --skip-external
 python benchmark/scripts/validate_crossrefs.py
 
 # Test specific file
-python benchmark/scripts/validate_crossrefs.py benchmark/A2A_GETTING_STARTED.md
+python benchmark/scripts/validate_crossrefs.py benchmark/GETTING_STARTED.md
 
 # Skip external link checks (faster, offline)
 python benchmark/scripts/validate_crossrefs.py --skip-external
@@ -311,5 +311,5 @@ Either:
 
 - **Testing scripts**: `benchmark/scripts/test_doc_examples.py`, `benchmark/scripts/validate_crossrefs.py`
 - **Schema definition**: `benchmark/docs/evaluation_bundle.schema.json`
-- **Example docs**: `benchmark/A2A_GETTING_STARTED.md`, `benchmark/docs/A2A_EXAMPLES.md`
+- **Example docs**: `benchmark/GETTING_STARTED.md`, `benchmark/docs/A2A_EXAMPLES.md`
 - **Architecture docs**: `benchmark/docs/ARCHITECTURE.md`

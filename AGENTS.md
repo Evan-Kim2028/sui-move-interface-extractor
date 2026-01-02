@@ -74,7 +74,7 @@ All documentation must be executable, verifiable, and maintainable.
 **Validation:**
 ```bash
 # Test A2A documentation examples
-python benchmark/scripts/test_doc_examples.py benchmark/A2A_GETTING_STARTED.md benchmark/docs/A2A_EXAMPLES.md
+python benchmark/scripts/test_doc_examples.py benchmark/GETTING_STARTED.md benchmark/docs/A2A_EXAMPLES.md
 ```
 
 ### Cross-Reference Validation
@@ -124,4 +124,4 @@ Before merging any doc changes:
 **Related documentation:**
 - `benchmark/docs/TESTING.md` - Complete testing guide
 - `benchmark/docs/A2A_EXAMPLES.md` - Request/response examples
-- `benchmark/A2A_GETTING_STARTED.md` - Quick start guide
+- `benchmark/GETTING_STARTED.md` - Canonical benchmark entrypoint

@@ -203,7 +203,7 @@ Invariants:
 - `scenario_smi/scenario.toml`: Scenario configuration (ports, commands)
 - `.env`: API keys for agent subprocesses (SMI_API_KEY, OPENROUTER_API_KEY)
 
-See `benchmark/A2A_GETTING_STARTED.md` for usage examples and `docs/A2A_EXAMPLES.md` for protocol details.
+See `benchmark/GETTING_STARTED.md` for usage examples and `benchmark/docs/A2A_EXAMPLES.md` for protocol details.
 
 ## Output schemas / versioning invariants
 

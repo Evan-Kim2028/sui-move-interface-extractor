@@ -40,6 +40,25 @@ The benchmark is designed to measure **planning and inhabitation intelligence**,
 - **Created types (evidence)**: Captured from transaction simulation results (dry-run).
 - **Primary metric (base-type hit rate)**: We score by matching **base types**, ignoring type arguments (e.g., `Coin<SUI>` matches `Coin<FOO>`).
 
+### Execution vs Task Completion
+
+We track two orthogonal dimensions:
+
+**Execution correctness** (`dry_run_ok`): Did the PTB execute without Move aborts?
+- Validates runtime behavior (preconditions, business logic, gas)
+- `true` = all Move code completed successfully
+
+**Task success** (`created_hits`): Did we create the target types?
+- Validates planning correctness (function selection, argument filling)
+- `hits = targets` → agent accomplished goal
+
+Common divergence patterns:
+1. **Wrong function**: Agent calls safe no-op instead of constructor
+2. **Wrong args**: Arguments lead to early return without creating objects
+3. **Inventory missing**: Required caps/objects not available (harmless execution)
+
+These are intentional: benchmark measures planning intelligence, not just syntax validity.
+
 ### The Mechanical Baseline (`baseline-search`)
 We use a deterministic, non-LLM baseline establishing the benchmark's "floor":
 1. **Candidate Selection**: Identifies all `public entry` functions.

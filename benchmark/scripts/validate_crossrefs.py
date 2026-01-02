@@ -164,15 +164,16 @@ def main(argv: List[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    missing_files = 0
     # Default to all docs
     if not args.files:
         args.files = [
-            Path("benchmark/A2A_GETTING_STARTED.md"),
             Path("benchmark/README.md"),
+            Path("benchmark/GETTING_STARTED.md"),
             Path("benchmark/docs/A2A_EXAMPLES.md"),
             Path("benchmark/docs/ARCHITECTURE.md"),
-            Path("benchmark/docs/METHODOLOGY.md"),
-            Path("docs/README.md"),
+            Path("docs/METHODOLOGY.md"),
+            Path("README.md"),
         ]
 
     total_broken = 0
@@ -180,16 +181,19 @@ def main(argv: List[str] | None = None) -> int:
 
     for md_path in args.files:
         if not md_path.exists():
+            missing_files += 1
             print(f"Warning: File not found: {md_path}")
             continue
 
         print(f"\nChecking {md_path}...")
 
-        results = validate_markdown_file(
-            md_path, args.doc_root, check_external=not args.skip_external
-        )
+        results = validate_markdown_file(md_path, args.doc_root, check_external=not args.skip_external)
 
-        broken = [(line, text, url, status) for line, text, url, status in results if status != "OK" and status != "SKIP_EXTERNAL"]
+        broken = [
+            (line, text, url, status)
+            for line, text, url, status in results
+            if status != "OK" and status != "SKIP_EXTERNAL"
+        ]
 
         if broken:
             print(f"  Found {len(broken)} issues:")
@@ -205,6 +209,7 @@ def main(argv: List[str] | None = None) -> int:
         else:
             print("  OK: All links valid")
 
+    total_warnings += missing_files
     print(f"\nTotal: {total_broken} broken, {total_warnings} warnings")
 
     return 1 if total_broken > 0 else 0

@@ -74,8 +74,9 @@ For corpus runs and reproducible validation loops, use `docs/RUNBOOK.md` or:
 
 The Python benchmark harness lives in `benchmark/`:
 
-- `benchmark/README.md` (start here)
-- `benchmark/A2A_GETTING_STARTED.md` (local A2A servers + smoke + preflight)
+- `benchmark/GETTING_STARTED.md` (canonical entrypoint)
+- `benchmark/README.md` (directory map)
+- `benchmark/docs/A2A_EXAMPLES.md` (local A2A servers + smoke + preflight walkthrough)
 
 ## AgentBeats / Berkeley “Green Agent” (AgentX)
 
