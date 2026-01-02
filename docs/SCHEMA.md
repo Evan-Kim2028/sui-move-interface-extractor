@@ -1,6 +1,6 @@
 # Schema and Stability Rules (`schema_version = 1`)
 
-This sandbox emits **canonical, diff-friendly JSON** derived from Move bytecode tables and/or Sui RPC normalized interfaces.
+This tool emits **canonical, diff-friendly JSON** derived from Move bytecode tables and/or Sui RPC normalized interfaces.
 
 The goal is that:
 

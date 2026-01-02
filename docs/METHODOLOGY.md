@@ -2,7 +2,7 @@
 
 This project is a **bytecode-first** analyzer for Sui Move packages.
 
-The core idea is simple:
+The core idea:
 
 - the authoritative source of a published package is its compiled Move bytecode (`.mv`)
 - we parse `.mv` directly and emit a **canonical, deterministic JSON** representation of the package interface
@@ -19,6 +19,8 @@ That binary contains the full set of declarations for a module:
 
 This tool parses those tables using `move-binary-format::file_format::CompiledModule` (from MystenLabs’ Sui/Move dependency),
 which is the standard Rust implementation of the Move bytecode format.
+
+See `docs/AGENTBEATS.md` for how this toolchain maps onto AgentBeats-style evaluation.
 
 ## What we emit
 
@@ -90,3 +92,8 @@ To turn this into an AgentBeats-style benchmark, the next layer is:
 - dry-run, inspect effects, and score by distinct `key` types created
 
 This project focuses on the bytecode/interface substrate that makes those evaluations deterministic and diffable.
+
+Next:
+
+- Use `docs/RUNBOOK.md` for reproducible commands.
+- Use `benchmark/README.md` for the Phase I/Phase II benchmark harness.

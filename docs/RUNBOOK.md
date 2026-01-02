@@ -2,12 +2,6 @@
 
 This runbook documents the intended workflow for running scans/validation and keeping results reproducible as the `sui-packages` dataset evolves.
 
-## Principles
-
-- Treat on-chain bytecode (`bcs.moduleMap`) as the ground truth.
-- Use RPC normalized interfaces as an independent cross-check (interface-level correctness).
-- Prefer deterministic outputs and stable ordering so diffs are meaningful.
-
 ## Before you run
 
 1. Ensure the bytecode dataset checkout exists:
@@ -123,3 +117,5 @@ Optionally maintain a human-readable snapshot log here:
   - (not compatible with RPC compare / interface compare)
 - For local-only scans where you want a strong integrity check, use:
   - `--corpus-local-bytes-check`
+
+For schema details and determinism rules, see `docs/SCHEMA.md`.

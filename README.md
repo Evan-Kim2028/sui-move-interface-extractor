@@ -8,11 +8,12 @@ It parses compiled `.mv` modules directly and emits canonical JSON for:
 - bytecode-derived interfaces (`--emit-bytecode-json`) including private functions and full signature types
 - rigorous comparison against RPC normalized interfaces (`--compare-bytecode-rpc`)
 
-## Schema
+## Docs
 
-- `docs/SCHEMA.md` documents the emitted JSON schemas and determinism rules.
-- `docs/METHODOLOGY.md` explains the bytecode-first approach, verification loops, and limitations.
-- `docs/RUNBOOK.md` has reproducible run commands.
+- Start here: `docs/README.md`
+- Schema: `docs/SCHEMA.md`
+- Run commands: `docs/RUNBOOK.md`
+- Methodology/limits: `docs/METHODOLOGY.md`
 
 ## Dataset (bytecode corpus) location
 
@@ -25,7 +26,7 @@ If you use the `sui-packages` dataset (a local artifact corpus), point at a corp
 
 Each package dir is expected to contain `bytecode_modules/*.mv` and typically includes `metadata.json` and `bcs.json`.
 
-## How to run
+## Quickstart
 
 Prereqs:
 
@@ -38,16 +39,14 @@ Dataset:
 git clone https://github.com/MystenLabs/sui-packages.git
 ```
 
-Reproduce a `mainnet_most_used` validation run (and write a shareable summary JSON):
+Emit a canonical interface JSON from a local artifact dir:
 
 ```bash
-mkdir -p results
-cargo run --release -- --bytecode-corpus-root ../sui-packages/packages/mainnet_most_used \
-  --out-dir out/corpus_interface_all_1000 \
-  --corpus-local-bytes-check \
-  --corpus-rpc-compare --corpus-interface-compare \
-  --concurrency 1 \
-  --emit-submission-summary results/mainnet_most_used_summary.json
+mkdir -p out
+cargo run --release -- \
+  --bytecode-package-dir ../sui-packages/packages/mainnet_most_used/0x00/00000000000000000000000000000000000000000000000000000000000002 \
+  --emit-bytecode-json out/0x2_interface.json \
+  --sanity
 ```
 
 Notes:
@@ -55,15 +54,26 @@ Notes:
 - `out/` is a scratch directory for large outputs (gitignored).
 - `results/` is intended for small, shareable summary JSONs only.
 
-## Repro Script
-
-For a one-command reproduction of `mainnet_most_used`, use:
+For corpus runs and reproducible validation loops, use `docs/RUNBOOK.md` or:
 
 - `scripts/reproduce_mainnet_most_used.sh`
 
-## Benchmark Harness
+## Benchmarks
 
-- Key-struct target discovery benchmark (Python/uv): `benchmark/README.md`
+The Python benchmark harness lives in `benchmark/`:
+
+- `benchmark/README.md`
+
+## AgentBeats / Berkeley “Green Agent” (AgentX)
+
+This repo is designed to be a clean substrate for building AgentBeats-style evaluations on Sui Move bytecode.
+
+- Competition/homepage: https://rdi.berkeley.edu/agentx-agentbeats
+- This repo provides:
+  - bytecode-first interface extraction (canonical JSON; includes private functions)
+  - verification loops against RPC normalized interfaces (corpus reports + mismatch samples)
+  - benchmark scaffolding in `benchmark/` (Phase I + Phase II)
+- See `docs/AGENTBEATS.md` for how Phase I/II map to an AgentBeats “green agent” workflow and what remains to implement.
 
 ## Docker
 
@@ -86,61 +96,4 @@ docker run --rm -v "$(pwd)/../sui-packages:/data/sui-packages" sui-move-interfac
   smi-bench --corpus-root /data/sui-packages/packages/mainnet_most_used --samples 25 --seed 1 --agent mock-empty
 ```
 
-Build:
-
-```bash
-cargo build
-```
-
-Emit bytecode-derived canonical interface JSON from RPC BCS bytes:
-
-```bash
-mkdir -p out
-cargo run --release -- --package-id 0x2 --emit-bytecode-json out/0x2_bytecode.json --sanity
-```
-
-Compare RPC normalized vs bytecode-derived interface (rigorous, field-by-field):
-
-```bash
-mkdir -p out
-cargo run --release -- --package-id 0x2 --compare-bytecode-rpc --emit-compare-report out/0x2_compare.json
-```
-
-Emit bytecode-derived canonical interface JSON from a local artifact dir:
-
-```bash
-cargo run --release -- --bytecode-package-dir ../sui-packages/packages/mainnet_most_used/0x00/00000000000000000000000000000000000000000000000000000000000002 \
-  --emit-bytecode-json out/0x2_local.json \
-  --sanity
-```
-
-Run the `mainnet_most_used` corpus scan (local-only):
-
-```bash
-cargo run --release -- --bytecode-corpus-root ../sui-packages/packages/mainnet_most_used \
-  --out-dir out/mainnet_most_used_local \
-  --corpus-local-bytes-check \
-  --concurrency 16
-```
-
-Run a corpus sample with rigorous interface compare:
-
-```bash
-cargo run --release -- --bytecode-corpus-root ../sui-packages/packages/mainnet_most_used \
-  --out-dir out/corpus_interface_sample200 \
-  --corpus-sample 200 --corpus-seed 1 \
-  --corpus-rpc-compare --corpus-interface-compare \
-  --concurrency 1
-```
-
-## Run metadata (dataset snapshot)
-
-Corpus runs write a `run_metadata.json` file into the `--out-dir` that captures:
-
-- start/end time (unix seconds)
-- full CLI argv
-- `rpc_url`
-- `bytecode_corpus_root`
-- best-effort `sui-packages` git HEAD (if the corpus path is inside a git checkout)
-
-This is the “guard rail” that makes results attributable even if the underlying dataset updates.
+For more commands (single-package RPC compare, full corpus runs, sampling, and how to interpret outputs), see `docs/RUNBOOK.md`.
