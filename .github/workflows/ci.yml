@@ -26,6 +26,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Rust binaries
+        run: cargo build --release --locked
       - uses: astral-sh/setup-uv@v3
       - name: sync
         working-directory: benchmark
