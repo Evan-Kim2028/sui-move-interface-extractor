@@ -14,6 +14,8 @@ def main() -> None:
     data = json.loads(path.read_text())
     samples = int(data.get("samples", 0))
     agg = data.get("aggregate") or {}
+    target_ids_file = data.get("target_ids_file")
+    target_ids_total = data.get("target_ids_total")
     errors = agg.get("errors")
     avg_f1 = agg.get("avg_f1")
     avg_precision = agg.get("avg_precision")
@@ -29,10 +31,11 @@ def main() -> None:
             last_err = last.get("error")
 
     print(
-        f"samples={samples} errors={errors} avg_f1={avg_f1} avg_precision={avg_precision} avg_recall={avg_recall} last_pkg={last_pkg} last_error={last_err}"
+        f"manifest={target_ids_file} manifest_total={target_ids_total} samples={samples} errors={errors} "
+        f"avg_f1={avg_f1} avg_precision={avg_precision} avg_recall={avg_recall} "
+        f"last_pkg={last_pkg} last_error={last_err}"
     )
 
 
 if __name__ == "__main__":
     main()
-
