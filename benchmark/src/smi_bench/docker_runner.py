@@ -31,8 +31,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generator
 
 if TYPE_CHECKING:
-    import docker
-    from docker.models.containers import Container
+    import docker  # type: ignore
+    from docker.models.containers import Container  # type: ignore
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,7 @@ DEFAULT_STOP_TIMEOUT = 30
 def _get_docker_client() -> "docker.DockerClient":
     """Get Docker client, with helpful error message if Docker is unavailable."""
     try:
-        import docker
+        import docker  # type: ignore
 
         return docker.from_env()
     except ImportError as e:
