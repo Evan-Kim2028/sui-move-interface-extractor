@@ -23,7 +23,7 @@ All notable changes to the Sui Move Interface Extractor project will be document
 - Fixed inconsistent git root detection across different modules.
 - Repaired truncated checkpoint writes that could lead to corrupted results.
 
-## [0.2.1] - 2025-12-28 (Internal Release)
+## [0.2.1] - 2026-01-01 (Internal Release)
 
 ### Added
 - **Recursive Constructor Discovery**: Implemented advanced static analysis to find multi-step paths for creating objects, increasing viable package coverage by 10x (from 27 to 292 packages).
@@ -33,7 +33,7 @@ All notable changes to the Sui Move Interface Extractor project will be document
 ### Changed
 - Improved `smi_tx_sim` to support transaction chaining and complex PTB constructs.
 
-## [0.2.0] - 2025-12-15
+## [0.2.0] - 2026-01-01
 
 ### Added
 - **Initial Phase II Support**: First implementation of the Type Inhabitation benchmark.
