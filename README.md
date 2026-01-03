@@ -1,113 +1,98 @@
 # `sui-move-interface-extractor`
 
-Standalone bytecode-first Rust CLI for parsing Sui Move `.mv` modules and producing deterministic, diff-friendly JSON interfaces.
+**Quantifying AI's understanding of Sui Move smart contracts through bytecode extraction and autonomous transaction planning.**
 
-It parses compiled `.mv` modules directly and emits canonical JSON for:
+This project provides a standalone Rust CLI for parsing Sui Move `.mv` modules into deterministic JSON and a Python-based benchmark harness to evaluate LLM performance on complex "Type Inhabitation" (autonomous transaction planning) challenges.
 
-- corpus-level scanning/verification (index + counts + diff stability)
-- bytecode-derived interfaces (`--emit-bytecode-json`) including private functions and full signature types
-- rigorous comparison against RPC normalized interfaces (`--compare-bytecode-rpc`)
+```mermaid
+graph LR
+    A[Sui Bytecode] --> B[Rust Extractor]
+    B --> C[JSON Interface]
+    C --> D[LLM Agent]
+    D --> E[PTB Generation]
+    E --> F[Transaction Simulation]
+    F --> G[Score / Metrics]
+```
 
-## Documentation Map
+## 🚀 Getting Started
 
-### 🚀 Getting Started
-- **[Benchmark Quickstart](benchmark/GETTING_STARTED.md)** - Run Phase II benchmarks in 5 minutes.
-- **[Rust CLI Runbook](docs/RUNBOOK.md)** - Reproducible extraction and verification commands.
+### 1. Environment Setup (3 minutes)
 
-### 📖 Reference
-- **[Methodology](docs/METHODOLOGY.md)** - Bytecode extraction logic and benchmark scoring rules.
-- **[JSON Schema](docs/SCHEMA.md)** - Exact interface and artifact schemas.
-- **[A2A Compliance](benchmark/docs/A2A_COMPLIANCE.md)** - Protocol implementation and testing strategy.
-- **[A2A Examples](benchmark/docs/A2A_EXAMPLES.md)** - JSON-RPC request/response walkthroughs.
+Ensure you have the **Rust toolchain** ([rustup.rs](https://rustup.rs)) and **uv** ([astral.sh/uv](https://astral.sh/uv)) installed.
 
-### 🛠️ Integration & Ops
-- **[AgentBeats Guide](docs/AGENTBEATS.md)** - Platform mapping and local scenario management.
-- **[Dataset Snapshots](docs/DATASET_SNAPSHOTS.md)** - Managing the bytecode corpus.
-- **[Troubleshooting](docs/TROUBLESHOOTING.md)** - Common issues and fixes.
+```bash
+# 1. Build the Rust binaries (Extractor & Simulator)
+cargo build --release --locked
+
+# 2. Setup the Python benchmark environment
+cd benchmark
+uv sync --group dev --frozen
+
+# 3. Clone the Bytecode Corpus (Required for testing)
+git clone --depth 1 https://github.com/MystenLabs/sui-packages.git ../sui-packages
+```
+
+### 2. ⚡ Fast Success Loop (The Top-25 Dataset)
+
+Instead of running the full 1,000+ package corpus, use our curated **Top-25** dataset. It provides high-signal coverage of diverse Sui Move patterns and completes in under 5 minutes.
+
+**Recommended Model:** Gemini 3 Flash Preview (`google/gemini-3-flash-preview`)
+
+```bash
+cd benchmark
+./scripts/run_model.sh --env-file .env \
+  --model google/gemini-3-flash-preview \
+  --dataset type_inhabitation_top25 \
+  --run-samples 5
+```
 
 ---
 
-## Dataset (bytecode corpus) location
+## 📖 Documentation Map
 
-Pass an explicit corpus root via `--bytecode-corpus-root`.
+### 🚀 Guides
+- **[Benchmark Quickstart](benchmark/GETTING_STARTED.md)** - Comprehensive Phase II walkthrough.
+- **[Rust CLI Runbook](docs/RUNBOOK.md)** - Direct bytecode extraction and verification commands.
+- **[Datasets Guide](benchmark/DATASETS.md)** - Creating and using curated package lists.
 
-If you use the `sui-packages` dataset (a local artifact corpus), point at a corpus root like:
+### 📖 Reference
+- **[Methodology](docs/METHODOLOGY.md)** - Bytecode extraction logic and scoring rules.
+- **[JSON Schema](docs/SCHEMA.md)** - Exact interface and result schemas.
+- **[A2A Compliance](benchmark/docs/A2A_COMPLIANCE.md)** - Agent-to-Agent protocol details.
 
-- `<sui-packages-checkout>/packages/mainnet_most_used`
-- `<sui-packages-checkout>/packages/mainnet`
+### 🛠️ Integration & Ops
+- **[AgentBeats Guide](docs/AGENTBEATS.md)** - Platform mapping and scenario management.
+- **[Troubleshooting](docs/TROUBLESHOOTING.md)** - Common issues and environment fixes.
 
-Each package dir is expected to contain `bytecode_modules/*.mv` and typically includes `metadata.json` and `bcs.json`.
+---
 
-## Quickstart
+## Direct Usage (Rust CLI)
 
-Prereqs:
-
-- Rust toolchain (stable): https://rustup.rs
-- `git`
-
-Dataset:
-
-```bash
-git clone https://github.com/MystenLabs/sui-packages.git
-```
-
-Emit a canonical interface JSON from a local artifact dir:
+Emit a canonical interface JSON from a local Sui Move package:
 
 ```bash
 mkdir -p out
-cargo run --release -- \
-  --bytecode-package-dir ../sui-packages/packages/mainnet_most_used/0x00/00000000000000000000000000000000000000000000000000000000000002 \
+./target/release/sui_move_interface_extractor \
+  --bytecode-package-dir ../sui-packages/packages/mainnet_most_used/0x00/00...02 \
   --emit-bytecode-json out/0x2_interface.json \
   --sanity
 ```
 
-Notes:
-
-- `out/` is a scratch directory for large outputs (gitignored).
-- `results/` is intended for small, shareable summary JSONs only.
-
-For corpus runs and reproducible validation loops, use `docs/RUNBOOK.md` or:
-
-- `scripts/reproduce_mainnet_most_used.sh`
-
-## Benchmarks
-
-The Python benchmark harness lives in `benchmark/`:
-
-- `benchmark/GETTING_STARTED.md` (canonical entrypoint)
-- `benchmark/README.md` (directory map)
-- `benchmark/docs/A2A_EXAMPLES.md` (local A2A servers + smoke + preflight walkthrough)
-
 ## AgentBeats / Berkeley “Green Agent” (AgentX)
 
-This repo is designed to be a clean substrate for building AgentBeats-style evaluations on Sui Move bytecode.
+This repo is the official substrate for the AgentBeats-style evaluations on Sui Move bytecode. It provides:
+- **Phase I (Discovery)**: Can the AI find critical data structures?
+- **Phase II (Inhabitation)**: Can the AI write valid transactions to create those structures?
 
-- Competition/homepage: https://rdi.berkeley.edu/agentx-agentbeats
-- This repo provides:
-  - bytecode-first interface extraction (canonical JSON; includes private functions)
-  - verification loops against RPC normalized interfaces (corpus reports + mismatch samples)
-  - benchmark scaffolding in `benchmark/` (Phase I + Phase II)
-- See `docs/AGENTBEATS.md` for how Phase I/II map to an AgentBeats “green agent” workflow and what remains to implement.
+See `docs/AGENTBEATS.md` for the platform roadmap.
 
 ## Docker
 
-Build:
+Build the unified benchmark and Rust environment:
 
 ```bash
-docker build -t sui-move-interface-extractor .
+docker compose build
+docker compose up -d --wait
 ```
 
-Run the Rust CLI:
-
-```bash
-docker run --rm sui-move-interface-extractor sui_move_interface_extractor --help
-```
-
-Run the benchmark (mount a local `sui-packages` checkout):
-
-```bash
-docker run --rm -v "$(pwd)/../sui-packages:/data/sui-packages" sui-move-interface-extractor \
-  smi-bench --corpus-root /data/sui-packages/packages/mainnet_most_used --samples 25 --seed 1 --agent mock-empty
-```
-
-For more commands (single-package RPC compare, full corpus runs, sampling, and how to interpret outputs), see `docs/RUNBOOK.md`.
+For more commands, see `docs/RUNBOOK.md`.
