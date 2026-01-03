@@ -50,19 +50,21 @@ cd benchmark
 
 ## 📖 Documentation Map
 
-### 🚀 Guides
-- **[Benchmark Quickstart](benchmark/GETTING_STARTED.md)** - Comprehensive Phase II walkthrough.
-- **[Rust CLI Runbook](docs/RUNBOOK.md)** - Direct bytecode extraction and verification commands.
-- **[Datasets Guide](benchmark/DATASETS.md)** - Creating and using curated package lists.
+### 🚀 Getting Started
+- **[Benchmark Guide](docs/BENCHMARK_GUIDE.md)** - Comprehensive walkthrough for Phase I & II.
+- **[CLI Reference](docs/CLI_REFERENCE.md)** - Commands for direct bytecode extraction and verification.
+- **[A2A Protocol](docs/A2A_PROTOCOL.md)** - Agent-to-Agent integration and tuning guide.
 
-### 📖 Reference
-- **[Methodology](docs/METHODOLOGY.md)** - Bytecode extraction logic and scoring rules.
+### 📖 Research & Methodology
+- **[Insights & Reward](docs/INSIGHTS.md)** - High-value takeaways and research value proposition.
+- **[Methodology](docs/METHODOLOGY.md)** - Scoring rules, bytecode-first logic, and AgentBeats mapping.
+- **[Architecture](docs/ARCHITECTURE.md)** - Maintainers' map of the system internals.
+- **[Contributing](docs/CONTRIBUTING.md)** - Developer standards and documentation guidelines.
+
+### 🛠️ Reference & Ops
+- **[Datasets Guide](docs/DATASETS.md)** - Creating and using curated package lists.
 - **[JSON Schema](docs/SCHEMA.md)** - Exact interface and result schemas.
-- **[A2A Compliance](benchmark/docs/A2A_COMPLIANCE.md)** - Agent-to-Agent protocol details.
-
-### 🛠️ Integration & Ops
-- **[AgentBeats Guide](docs/AGENTBEATS.md)** - Platform mapping and scenario management.
-- **[Troubleshooting](docs/TROUBLESHOOTING.md)** - Common issues and environment fixes.
+- **[Troubleshooting](docs/TROUBLESHOOTING.md)** - Common environment issues and fixes.
 
 ---
 

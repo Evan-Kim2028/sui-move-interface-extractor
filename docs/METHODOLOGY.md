@@ -76,9 +76,26 @@ We use a deterministic, non-LLM baseline establishing the benchmark's "floor":
 
 ---
 
+## 4. Platform Integration (AgentBeats)
+
+This framework is designed as a **"Green Agent" substrate** for the Berkeley RDI [AgentBeats](https://rdi.berkeley.edu/agentx-agentbeats) evaluation ecosystem.
+
+### Why Bytecode-First for AgentBeats?
+AgentBeats requires a verifiable, fair baseline for scoring agents. By using bytecode abilities as the source of truth, we ensure:
+1. **No Human Labeling Bias**: The target set is derived mechanically from the blockchain's own declarations.
+2. **Fair Comparison**: All agents are evaluated against the same canonical JSON interface, which remains stable across different Sui RPC providers.
+
+### Execution Layer
+The framework provides an A2A-compliant server that handles the "Benchmarking Lifecycle":
+- **Discovery**: Phase I evaluates key-struct identification.
+- **Action**: Phase II evaluates the logic of the generated PTB (Programmable Transaction Block).
+
+---
+
 ## Related Documentation
 
-- [SCHEMA.md](SCHEMA.md) - Exact JSON schema and stability rules.
-- [RUNBOOK.md](RUNBOOK.md) - Reproducible commands for extraction and verification.
-- [A2A_COMPLIANCE.md](../benchmark/docs/A2A_COMPLIANCE.md) - Protocol implementation and testing strategy.
-- [GETTING_STARTED.md](../benchmark/GETTING_STARTED.md) - Quick start for running benchmarks.
+- **[Insights & Reward](INSIGHTS.md)** - High-value takeaways and research value proposition.
+- **[Benchmark Guide](BENCHMARK_GUIDE.md)** - Walkthrough for running benchmarks.
+- **[CLI Reference](CLI_REFERENCE.md)** - Rust CLI commands.
+- **[A2A Protocol](A2A_PROTOCOL.md)** - Integration and tuning details.
+- **[JSON Schema](SCHEMA.md)** - Interface and result schemas.

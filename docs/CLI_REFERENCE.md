@@ -1,4 +1,4 @@
-# `sui-move-interface-extractor` runbook
+# Sui Move Interface Extractor: CLI Reference
 
 This runbook documents the intended workflow for running scans/validation and keeping results reproducible as the `sui-packages` dataset evolves.
 
@@ -118,4 +118,5 @@ Optionally maintain a human-readable snapshot log here:
 - For local-only scans where you want a strong integrity check, use:
   - `--corpus-local-bytes-check`
 
-For schema details and determinism rules, see `docs/SCHEMA.md`.
+For schema details and determinism rules, see **[JSON Schema](SCHEMA.md)**.
+For benchmark execution, see **[Benchmark Guide](BENCHMARK_GUIDE.md)**.

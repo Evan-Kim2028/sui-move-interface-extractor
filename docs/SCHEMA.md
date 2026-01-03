@@ -145,4 +145,13 @@ Fields:
 - `exact_match_modules`: number of modules whose `len` and `sha256` match
 - `mismatches_total`: total mismatching modules (includes missing modules)
 - `missing_in_bcs`, `missing_in_mv`: module name lists
-- `mismatches_sample`: up to N mismatches with `{module, reason, mv_len?, bcs_len?, mv_sha256?, bcs_sha256?}`
+## 7) Evaluation Bundle JSON (A2A Layer)
+
+The A2A layer produces a standardized evaluation bundle. See the JSON Schema at `docs/schemas/evaluation_bundle.schema.json`.
+
+Top-level object:
+- `schema_version`: `1`
+- `benchmark`: `"phase2_inhabit"`
+- `metrics`: Object containing `avg_hit_rate`, `errors`, `packages_total`, etc.
+- `artifacts`: Map of result file paths (relative to run root).
+- `errors`: List of per-package error detail objects.
