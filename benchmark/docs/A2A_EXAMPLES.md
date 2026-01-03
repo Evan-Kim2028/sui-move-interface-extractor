@@ -12,7 +12,7 @@ cd benchmark
 uv run smi-a2a-smoke \
   --scenario scenario_smi \
   --corpus-root <CORPUS_ROOT> \
-  --package-ids-file manifests/standard_phase2_no_framework.txt \
+  --dataset type_inhabitation_top25 \
   --samples 1
 ```
 
@@ -300,12 +300,87 @@ For a successful single-package run:
 
 ```json
 {"agent": "real-openai-compatible", "event": "run_started", "seed": 0, "simulation_mode": "dry-run", "started_at_unix_seconds": 1767323740, "t": 1767323740}
-{"api_key": "len=73 suffix=6abef7", "base_url": "https://openrouter.ai/api/v1", "event": "agent_effective_config", "model": "anthropic/claude-sonnet-4.5", "provider": "openai_compatible", "t": 1767323741}
+{"api_key": "len=73 suffix=6abef7", "base_url": "https://openrouter.ai/api/v1", "event": "agent_effective_config", "model": "google/gemini-3-flash-preview", "provider": "openai_compatible", "t": 1767323741}
 {"event": "package_started", "i": 1, "package_id": "0x00db9a10bb9536ab367b7d1ffa404c1d6c55f009076df1139dc108dd86608bbe", "t": 1767323741}
 {"event": "sim_attempt_started", "gas_budget": 10000000, "i": 1, "package_id": "0x00db9a10bb9536ab367b7d1ffa404c1d6c55f009076df1139dc108dd86608bbe", "plan_attempt": 2, "plan_variant": "base", "sim_attempt": 1, "t": 1767323756}
 {"created_hits": 0, "dry_run_ok": false, "elapsed_seconds": 15.617967750004027, "error": null, "event": "package_finished", "i": 1, "package_id": "0x00db9a10bb9536ab367b7d1ffa404c1d6c55f009076df1139dc108dd86608bbe", "plan_variant": "base", "t": 1767323756, "targets": 2, "timed_out": false}
 {"avg_hit_rate": 0.0, "errors": 0, "event": "run_finished", "finished_at_unix_seconds": 1767323756, "samples": 1, "t": 1767323756}
 ```
+
+### Progressive Exposure (Design Note)
+
+**Important:** The progressive exposure feature with `need_more` requests is documented below for completeness. **Response handling is not yet implemented** in the current version. See [ARCHITECTURE.md](ARCHITECTURE.md#progressive-exposure-design) for current implementation status and [A2A_TUNING.md](A2A_TUNING.md) for practical tuning guidance.
+
+**Intended `need_more` Workflow (when fully implemented):**
+
+When a model needs more interface details than initially provided, it can request specific functions:
+
+```json
+{
+  "need_more": [
+    "0x2::coin::mint",
+    "0x2::coin::transfer",
+    "0xPACKAGE::module::create_wrapper"
+  ],
+  "reason": "Need to understand mint/transfer entry points and wrapper initialization"
+}
+```
+
+The runner would then:
+1. Extract requested target strings from the `need_more` array
+2. Re-invoke the model with a focused interface summary using `mode="focused"`
+3. Include only the requested functions with full signatures
+
+**Example Progressive Exposure Sequence:**
+
+*Call 1 (Initial Request):*
+```json
+{"event": "package_started", "package_id": "0x...", "t": 1767323741}
+```
+
+Model returns (first attempt):
+```json
+{
+  "need_more": [
+    "0x2::coin::mint",
+    "0x2::coin::transfer"
+  ],
+  "reason": "Need mint and transfer functions to create coins"
+}
+```
+
+*Call 2 (Focused Details):*
+The runner re-invokes the model with:
+```python
+summarize_interface(
+    interface_json,
+    max_functions=60,
+    mode="focused",
+    requested_targets={"0x2::coin::mint", "0x2::coin::transfer"}
+)
+```
+
+Model returns (final PTB plan):
+```json
+{
+  "calls": [
+    {
+      "target": "0x2::coin::mint",
+      "type_args": ["0x2::sui::SUI"],
+      "args": [
+        {"u64": 1000000000}
+      ]
+    }
+  ]
+}
+```
+
+*Call 3 (Simulation):*
+```json
+{"event": "sim_attempt_started", "gas_budget": 10000000, "plan_attempt": 1, "planning_call": 2, "t": 1767323756}
+```
+
+**Note:** When progressive exposure is fully implemented, additional event types will track `need_more` requests and focused summary generation. The `--max-planning-calls` parameter controls how many LLM calls are allowed per package (default: 50, recommended: 2-3 for production).
 
 ### Event Types
 
@@ -520,5 +595,6 @@ jq '.result.artifacts[0].parts[0].text | fromjson | .metrics' results/a2a_smoke_
 ## Related Documentation
 
 - [GETTING_STARTED.md](../GETTING_STARTED.md) - Quick start guide
-- [ARCHITECTURE.md](ARCHITECTURE.md) - A2A Layer design details
+- [ARCHITECTURE.md](ARCHITECTURE.md) - A2A Layer design details and progressive exposure implementation status
+- [A2A_TUNING.md](A2A_TUNING.md) - Practical tuning guidance for progressive exposure, interface modes, and cost optimization
 - [evaluation_bundle.schema.json](evaluation_bundle.schema.json) - Full schema definition

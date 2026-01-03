@@ -54,7 +54,7 @@ Recommended (OpenRouter): one key for many models.
 ```env
 OPENROUTER_API_KEY=sk-or-v1-...
 SMI_API_BASE_URL=https://openrouter.ai/api/v1
-SMI_MODEL=anthropic/claude-sonnet-4.5
+SMI_MODEL=google/gemini-3-flash-preview
 
 # Optional but recommended for "real" dry-runs (see note below)
 SMI_SENDER=0xYOUR_FUNDED_MAINNET_ADDRESS
