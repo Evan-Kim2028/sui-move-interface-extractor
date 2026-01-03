@@ -30,7 +30,7 @@ def compute_json_checksum(data: dict[str, Any]) -> str:
     Returns:
         8-character hex checksum.
     """
-    json_str = json.dumps(data, sort_keys=True, separators=( ",", ":"))
+    json_str = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(json_str.encode()).hexdigest()[:8]
 
 
@@ -69,7 +69,7 @@ def write_checkpoint(
         # Add checksum for corruption detection
         checksum = compute_json_checksum(data)
         data["_checksum"] = checksum
-        
+
         json_str = json.dumps(data, indent=2, sort_keys=True) + "\n"
         tmp.write_text(json_str)
         tmp.replace(out_path)
@@ -110,9 +110,7 @@ def load_checkpoint(out_path: Path, context: str = "checkpoint") -> dict[str, An
         ) from exc
     except (OSError, PermissionError) as exc:
         raise RuntimeError(
-            f"Failed to read {context} file: {out_path}\n"
-            f"  Error: {exc}\n"
-            f"  Check file permissions and disk space."
+            f"Failed to read {context} file: {out_path}\n  Error: {exc}\n  Check file permissions and disk space."
         ) from exc
 
     try:

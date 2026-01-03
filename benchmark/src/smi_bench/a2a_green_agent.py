@@ -269,6 +269,10 @@ def _card(*, url: str) -> AgentCard:
     )
 
 
+# Global reference for shutdown handling
+_global_executor: SmiBenchGreenExecutor | None = None
+
+
 class SmiBenchGreenExecutor(AgentExecutor):
     def __init__(self) -> None:
         super().__init__()
@@ -277,6 +281,48 @@ class SmiBenchGreenExecutor(AgentExecutor):
         self._task_cancel_events: dict[str, asyncio.Event] = {}
         # Limit concurrency to prevent OOM and RPC stampedes
         self._concurrency_semaphore: asyncio.Semaphore | None = None
+
+        # Register this instance globally for signal/shutdown handling
+        global _global_executor
+        _global_executor = self
+
+    async def shutdown(self) -> None:
+        """
+        Gracefully terminate all running task processes.
+        Called on server shutdown (SIGINT/SIGTERM).
+        """
+        active_task_ids = list(self._task_processes.keys())
+        if not active_task_ids:
+            return
+
+        print(f"Shutting down {len(active_task_ids)} active benchmark tasks...")
+
+        # Send termination signals to all
+        termination_tasks = []
+        for task_id in active_task_ids:
+            proc = self._task_processes.get(task_id)
+            if proc and proc.returncode is None:
+                # We don't have a TaskUpdater here so we use a mock-like termination
+                try:
+                    proc.terminate()
+                    termination_tasks.append(asyncio.wait_for(proc.wait(), timeout=2.0))
+                except Exception:
+                    pass
+
+        if termination_tasks:
+            await asyncio.gather(*termination_tasks, return_exceptions=True)
+
+        # Force kill any survivors
+        for task_id in active_task_ids:
+            proc = self._task_processes.get(task_id)
+            if proc and proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+        self._task_processes.clear()
+        print("All benchmark tasks terminated.")
 
     async def execute(self, context: RequestContext, event_queue: EventQueue) -> None:
         if self._concurrency_semaphore is None:
@@ -380,44 +426,54 @@ class SmiBenchGreenExecutor(AgentExecutor):
         log_dir = repo_root / "logs"
         events_path = log_dir / run_id / "events.jsonl"
         run_metadata_path = log_dir / run_id / "run_metadata.json"
-        
+
         venv_bin = repo_root / ".venv" / "bin"
 
         args = [
             str(venv_bin / "smi-inhabit"),
-            "--corpus-root", str(cfg.corpus_root),
-            "--package-ids-file", str(cfg.package_ids_file),
-            "--agent", cfg.agent,
-            "--rpc-url", cfg.rpc_url,
-            "--simulation-mode", cfg.simulation_mode,
-            "--per-package-timeout-seconds", str(cfg.per_package_timeout_seconds),
-            "--max-plan-attempts", str(cfg.max_plan_attempts),
-            "--out", str(out_json),
-            "--run-id", run_id,
-            "--samples", str(cfg.samples),
+            "--corpus-root",
+            str(cfg.corpus_root),
+            "--package-ids-file",
+            str(cfg.package_ids_file),
+            "--agent",
+            cfg.agent,
+            "--rpc-url",
+            cfg.rpc_url,
+            "--simulation-mode",
+            cfg.simulation_mode,
+            "--per-package-timeout-seconds",
+            str(cfg.per_package_timeout_seconds),
+            "--max-plan-attempts",
+            str(cfg.max_plan_attempts),
+            "--out",
+            str(out_json),
+            "--run-id",
+            run_id,
+            "--samples",
+            str(cfg.samples),
         ]
-        
+
         # Pass through tunable parameters from config
-        if "max_planning_calls" in config:
-            args.extend(["--max-planning-calls", str(int(config["max_planning_calls"]))])
+        if config:
+            if "max_planning_calls" in config:
+                args.extend(["--max-planning-calls", str(int(config["max_planning_calls"]))])
 
         if cfg.continue_on_error:
             args.append("--continue-on-error")
-        if cfg.resume:
-            args.append("--resume")
-        
+
         # Add additional tunable parameters
-        sender = config.get("sender")
-        if sender:
-            args.extend(["--sender", str(sender)])
-            
-        gas_budget = config.get("gas_budget")
-        if gas_budget:
-            args.extend(["--gas-budget", str(gas_budget)])
-            
-        checkpoint_every = config.get("checkpoint_every")
-        if checkpoint_every:
-            args.extend(["--checkpoint-every", str(checkpoint_every)])
+        if config:
+            sender = config.get("sender")
+            if sender:
+                args.extend(["--sender", str(sender)])
+
+            gas_budget = config.get("gas_budget")
+            if gas_budget:
+                args.extend(["--gas-budget", str(gas_budget)])
+
+            checkpoint_every = config.get("checkpoint_every")
+            if checkpoint_every:
+                args.extend(["--checkpoint-every", str(checkpoint_every)])
 
         # Sanitize environment to prevent accidental bleed-through
         # while preserving essential system paths and SMI configuration.
@@ -704,6 +760,12 @@ def build_app(*, public_url: str) -> Any:
         task_store=InMemoryTaskStore(),
     )
     app = A2AStarletteApplication(agent_card=card, http_handler=handler).build()
+
+    # Register shutdown handler
+    @app.on_event("shutdown")
+    async def shutdown_event():
+        if _global_executor:
+            await _global_executor.shutdown()
 
     # Add health check endpoint with comprehensive status
     @app.route("/health")

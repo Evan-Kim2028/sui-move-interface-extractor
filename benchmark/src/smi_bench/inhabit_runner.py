@@ -1071,9 +1071,12 @@ def run(
                                 dev_inspect_bin=dev_inspect_bin,
                                 rpc_url=rpc_url,
                                 sender=sender,
+                                mode=simulation_mode,
+                                gas_budget=None,
+                                gas_coin=None,
+                                bytecode_package_dir=None,
                                 ptb_spec=ptb_spec,
-                                simulation_mode=simulation_mode,
-                                call_timeout_seconds=max(1.0, remaining),
+                                timeout_s=max(1.0, remaining),
                             )
                             tx_build_ok = True
                             dev_inspect_ok = simulation_mode == "dev-inspect"
