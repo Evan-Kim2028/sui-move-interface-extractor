@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -30,14 +33,14 @@ def main(argv: list[str] | None = None) -> None:
         targets = score.get("targets")
         try:
             targets_i = int(targets)
-        except Exception:
+        except (ValueError, TypeError):
             continue
         if targets_i >= args.min_targets:
             out_ids.append(pkg)
 
     args.out_manifest.parent.mkdir(parents=True, exist_ok=True)
     args.out_manifest.write_text("\n".join(out_ids) + ("\n" if out_ids else ""), encoding="utf-8")
-    print(f"packages_kept={len(out_ids)}")
+    logger.info(f"packages_kept={len(out_ids)}")
 
 
 if __name__ == "__main__":

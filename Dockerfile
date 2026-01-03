@@ -28,9 +28,13 @@ FROM python:3.11-slim-bookworm AS runtime
 
 WORKDIR /app
 
+# Install runtime dependencies including tini for proper PID 1 signal handling
+# and curl for health checks
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    curl \
     git \
+    tini \
   && rm -rf /var/lib/apt/lists/*
 
 RUN python -m pip install --no-cache-dir uv==0.8.15
@@ -56,12 +60,24 @@ COPY benchmark/src ./benchmark/src
 # Ensure the project is synced
 RUN cd /app/benchmark && uv sync --frozen --no-dev
 
+# Create non-root user for security (UID 1000 matches common host user)
+RUN useradd -m -u 1000 -s /bin/bash smi && \
+    mkdir -p /app/results /app/logs /tmp/smi_bench && \
+    chown -R smi:smi /app /tmp/smi_bench
+
 ENV PATH="/app/benchmark/.venv/bin:${PATH}" \
     SMI_RUST_BIN="/usr/local/bin/sui_move_interface_extractor" \
     SMI_TX_SIM_BIN="/usr/local/bin/smi_tx_sim" \
     SMI_TEMP_DIR="/tmp/smi_bench"
 
+# Switch to non-root user
+USER smi
+
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:9999/health || exit 1
 
-ENTRYPOINT ["smi-a2a-green"]
+# Use SIGINT for graceful uvicorn shutdown
+STOPSIGNAL SIGINT
+
+# Use tini as PID 1 to properly handle signals and reap zombies
+ENTRYPOINT ["/usr/bin/tini", "--", "smi-a2a-green"]

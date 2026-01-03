@@ -53,19 +53,49 @@ jobs:
       - uses: actions/checkout@v4
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Install Sui CLI
+      
+      - name: Create test directories
         run: |
-          # Use a pre-built binary or simple install script for speed in CI
-          # For now, we'll install via cargo as it is the most reliable way 
-          # to match the environment, or use homebrew on mac (but this is ubuntu).
-          # Pragmatic choice: use the binary if available, or just skip if too slow.
-          # Better: The smoke test creates its own mock if sui isn't found.
-          # I updated prepare_test_corpus.sh to check for 'sui'.
-          echo "Sui CLI install skipped; using mock data if needed."
-      - name: Run Docker Smoke Test
+          mkdir -p benchmark/data/corpus results logs
+          # Create minimal mock corpus for CI
+          mkdir -p benchmark/data/corpus/0x00/fixture/bytecode_modules
+          echo '{"id": "0x0000000000000000000000000000000000000000000000000000000000000001"}' > benchmark/data/corpus/0x00/fixture/metadata.json
+          touch benchmark/data/corpus/0x00/fixture/bytecode_modules/dummy.mv
+          echo "0x0000000000000000000000000000000000000000000000000000000000000001" > benchmark/data/corpus/manifest.txt
+      
+      - name: Build and start container
         run: |
-          # We force mock-empty agent to avoid needing API keys in CI
           export SMI_AGENT="mock-empty"
-          chmod +x scripts/test_docker_a2a.sh
-          ./scripts/test_docker_a2a.sh
-
+          docker compose build
+          docker compose up -d --wait --wait-timeout 60
+      
+      - name: Verify agent health
+        run: |
+          curl -f http://localhost:9999/health
+          curl -f http://localhost:9999/.well-known/agent-card.json
+      
+      - name: Run smoke test
+        run: |
+          docker compose exec -T smi-bench smi-inhabit \
+            --corpus-root /app/corpus \
+            --package-ids-file /app/corpus/manifest.txt \
+            --samples 1 \
+            --agent mock-empty \
+            --simulation-mode dry-run \
+            --out /app/results/ci_smoke.json \
+            --no-log
+      
+      - name: Verify results
+        run: |
+          if [ -f results/ci_smoke.json ]; then
+            echo "SUCCESS: Result file generated"
+            head -50 results/ci_smoke.json
+          else
+            echo "FAILURE: Result file not found"
+            docker compose logs
+            exit 1
+          fi
+      
+      - name: Cleanup
+        if: always()
+        run: docker compose down --timeout 10

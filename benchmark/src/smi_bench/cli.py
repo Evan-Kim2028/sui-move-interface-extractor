@@ -1,10 +1,14 @@
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 from smi_bench import inhabit_manifest as phase2_manifest
 from smi_bench import inhabit_runner as phase2_runner
 from smi_bench import runner as phase1
+from smi_bench.constants import DEFAULT_RPC_URL
+
+logger = logging.getLogger(__name__)
 
 
 def run_all(args):
@@ -13,7 +17,7 @@ def run_all(args):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Phase I
-    print("--- Running Phase I (Key Struct Discovery) ---")
+    logger.info("--- Running Phase I (Key Struct Discovery) ---")
     p1_out = out_dir / "phase1.json"
     # Note: Phase I currently runs on a sample of the corpus.
     # We use mock-empty to just benchmark the infrastructure/dataset,
@@ -34,11 +38,11 @@ def run_all(args):
         phase1.main(phase1_argv)
     except SystemExit as e:
         if e.code != 0:
-            print(f"Phase I failed with code {e.code}")
+            logger.error(f"Phase I failed with code {e.code}")
             sys.exit(e.code)
 
     # 2. Phase II Manifest
-    print("\n--- Running Phase II (Manifest Generation) ---")
+    logger.info("--- Running Phase II (Manifest Generation) ---")
     p2_ids = out_dir / "phase2_ids.txt"
     p2_plan = out_dir / "phase2_plan.json"
     p2_report = out_dir / "phase2_viability.json"
@@ -60,11 +64,11 @@ def run_all(args):
         phase2_manifest.main(manifest_argv)
     except SystemExit as e:
         if e.code != 0:
-            print(f"Phase II Manifest failed with code {e.code}")
+            logger.error(f"Phase II Manifest failed with code {e.code}")
             sys.exit(e.code)
 
     # 3. Phase II Execution
-    print("\n--- Running Phase II (Execution) ---")
+    logger.info("--- Running Phase II (Execution) ---")
     p2_exec = out_dir / "phase2_execution.json"
 
     # Determine mode based on sender availability
@@ -111,10 +115,10 @@ def run_all(args):
         phase2_runner.main(runner_argv)
     except SystemExit as e:
         if e.code != 0:
-            print(f"Phase II Execution failed with code {e.code}")
+            logger.error(f"Phase II Execution failed with code {e.code}")
             sys.exit(e.code)
 
-    print(f"\nAll done! Results in {out_dir}")
+    logger.info(f"All done! Results in {out_dir}")
 
 
 def main():
@@ -128,7 +132,7 @@ def main():
     )
     p_all.add_argument("--out-dir", type=Path, required=True, help="Directory to save all results")
     p_all.add_argument("--samples", type=int, default=100, help="Number of packages to process")
-    p_all.add_argument("--rpc-url", type=str, default="https://fullnode.mainnet.sui.io:443")
+    p_all.add_argument("--rpc-url", type=str, default=DEFAULT_RPC_URL)
     p_all.add_argument("--sender", type=str, help="Funded wallet address for dry-run execution (optional)")
 
     args = parser.parse_args()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -18,6 +19,8 @@ import httpx
 
 from smi_bench.inhabit.score import normalize_type_string
 from smi_bench.utils import get_smi_temp_dir, run_json_helper
+
+logger = logging.getLogger(__name__)
 
 
 def pid_is_alive(pid: int) -> bool:
@@ -41,7 +44,23 @@ def check_run_guards(*, parent_pid: int | None, run_deadline: float | None) -> N
 
 
 def fetch_inventory(rpc_url: str, sender: str) -> dict[str, list[str]]:
+    """
+    Fetch owned objects from the Sui RPC for the given sender address.
+
+    Args:
+        rpc_url: Sui RPC endpoint URL
+        sender: Sender address (must start with 0x)
+
+    Returns:
+        Dict mapping normalized type strings to lists of object IDs.
+        Returns empty dict for mock/invalid addresses (0x0).
+
+    Raises:
+        RuntimeError: If RPC request fails (non-mock address)
+    """
+    # Mock addresses return empty inventory (expected behavior)
     if sender == "0x0" or not sender.startswith("0x"):
+        logger.debug(f"Skipping inventory fetch for mock/invalid sender: {sender}")
         return {}
 
     try:
@@ -55,11 +74,17 @@ def fetch_inventory(rpc_url: str, sender: str) -> dict[str, list[str]]:
                 "params": [sender, {"filter": None, "options": {"showType": True}}, cursor, 50],
             }
             resp = httpx.post(rpc_url, json=payload, timeout=30)
+
             if resp.status_code != 200:
-                break
+                logger.error(f"RPC request failed: status={resp.status_code}, url={rpc_url}, sender={sender}")
+                raise RuntimeError(f"Sui RPC returned status {resp.status_code} for suix_getOwnedObjects")
+
             res = resp.json()
             if "error" in res:
-                break
+                error_msg = res.get("error", {})
+                logger.error(f"RPC error response: {error_msg}, url={rpc_url}, sender={sender}")
+                raise RuntimeError(f"Sui RPC error: {error_msg.get('message', error_msg)}")
+
             data = res.get("result", {})
             for item in data.get("data", []):
                 objects.append(item)
@@ -67,6 +92,7 @@ def fetch_inventory(rpc_url: str, sender: str) -> dict[str, list[str]]:
                 break
             cursor = data.get("nextCursor")
             if len(objects) > 200:
+                logger.warning(f"Truncating inventory fetch at 200 objects for sender={sender}")
                 break
 
         inventory = {}
@@ -78,9 +104,20 @@ def fetch_inventory(rpc_url: str, sender: str) -> dict[str, list[str]]:
                 if t_norm not in inventory:
                     inventory[t_norm] = []
                 inventory[t_norm].append(oid)
+
+        logger.debug(f"Fetched inventory: {len(inventory)} types, {len(objects)} objects")
         return inventory
-    except Exception:
-        return {}
+
+    except httpx.TimeoutException as e:
+        logger.error(f"RPC timeout: url={rpc_url}, sender={sender}, error={e}")
+        raise RuntimeError(f"Sui RPC timeout after 30s: {rpc_url}") from e
+    except httpx.RequestError as e:
+        logger.error(f"RPC request error: url={rpc_url}, sender={sender}, error={e}")
+        raise RuntimeError(f"Failed to connect to Sui RPC {rpc_url}: {e}") from e
+    except Exception as e:
+        # Log unexpected errors with full context
+        logger.exception(f"Unexpected error in fetch_inventory: url={rpc_url}, sender={sender}")
+        raise RuntimeError(f"fetch_inventory failed: {type(e).__name__}: {e}") from e
 
 
 def resolve_placeholders(ptb_spec: dict[str, Any], inventory: dict[str, list[str]]) -> bool:
@@ -233,5 +270,5 @@ def run_tx_sim_via_helper(
         if tmp_path.exists():
             try:
                 tmp_path.unlink()
-            except Exception:
+            except OSError:
                 pass

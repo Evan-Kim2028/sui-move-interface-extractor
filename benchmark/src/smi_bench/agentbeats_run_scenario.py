@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from smi_bench.env import load_dotenv
@@ -45,7 +46,7 @@ def main(argv: list[str] | None = None) -> None:
             try:
                 with socket.create_connection((host, port), timeout=0.5):
                     return True
-            except Exception:
+            except (OSError, socket.timeout):
                 return False
 
         def get_pid_on_port(port: int) -> str | None:
@@ -72,7 +73,7 @@ def main(argv: list[str] | None = None) -> None:
                     return lines[0]
                 else:
                     return None
-            except Exception:
+            except (subprocess.CalledProcessError, FileNotFoundError, OSError):
                 return None
 
         # Default ports for scenario_smi
@@ -105,8 +106,8 @@ def main(argv: list[str] | None = None) -> None:
 
         try:
             data = json.loads(pid_file.read_text(encoding="utf-8"))
-        except Exception:
-            print(f"pid_file_unreadable={pid_file}")
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"pid_file_unreadable={pid_file}: {e}")
             return
 
         # ScenarioManager does not expose child process handles; kill is best-effort.
@@ -138,7 +139,7 @@ def main(argv: list[str] | None = None) -> None:
                         if p:
                             print(f"terminating_port_process={p}_on_{port}")
                             os.kill(int(p), signal.SIGTERM)
-                except Exception:
+                except (OSError, ValueError, subprocess.CalledProcessError):
                     pass
 
         if pid_file.exists():
@@ -204,8 +205,8 @@ def main(argv: list[str] | None = None) -> None:
             "scenario_manager_pid": os.getpid(),
         }
         pid_file.write_text(json.dumps(pids, indent=2, sort_keys=True), encoding="utf-8")
-    except Exception:
-        pass
+    except (OSError, IOError) as e:
+        print(f"Warning: Failed to save PID file {pid_file}: {e}", file=sys.stderr)
 
     if args.backend and args.frontend:
         manager.start_battle(backend_url=args.backend, frontend_url=args.frontend)

@@ -5,12 +5,16 @@ import asyncio
 import collections
 import inspect
 import json
+import logging
 import os
+import signal
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 import uvicorn
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.apps import A2AStarletteApplication
@@ -24,8 +28,14 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from smi_bench.a2a_errors import A2AError, InvalidConfigError, TaskNotCancelableError
+from smi_bench.constants import (
+    DEFAULT_RPC_URL,
+    HEALTH_CHECK_TIMEOUT_SECONDS,
+)
 from smi_bench.schema import Phase2ResultKeys
 from smi_bench.utils import safe_json_loads
+
+logger = logging.getLogger(__name__)
 
 # A2A Protocol version this implementation supports
 A2A_PROTOCOL_VERSION = "0.3.0"
@@ -52,14 +62,14 @@ class EvalConfig:
 def _safe_int(v: Any, default: int) -> int:
     try:
         return int(v)
-    except Exception:
+    except (ValueError, TypeError):
         return default
 
 
 def _safe_float(v: Any, default: float) -> float:
     try:
         return float(v)
-    except Exception:
+    except (ValueError, TypeError):
         return default
 
 
@@ -75,13 +85,22 @@ def _load_cfg(raw: Any) -> EvalConfig:
     if not package_ids_file:
         raise InvalidConfigError("package_ids_file", "missing or empty")
 
+    # Fail-fast validation: simulation modes that require sender
+    simulation_mode = str(raw.get("simulation_mode") or "dry-run")
+    sender = raw.get("sender")
+    if simulation_mode in ("dev-inspect", "execute") and not sender:
+        raise InvalidConfigError(
+            "sender",
+            f"required for simulation_mode={simulation_mode} (provide a valid Sui address)",
+        )
+
     return EvalConfig(
         corpus_root=corpus_root,
         package_ids_file=package_ids_file,
         samples=_safe_int(raw.get("samples"), 0),
         agent=str(raw.get("agent") or "real-openai-compatible"),
-        rpc_url=str(raw.get("rpc_url") or "https://fullnode.mainnet.sui.io:443"),
-        simulation_mode=str(raw.get("simulation_mode") or "dry-run"),
+        rpc_url=str(raw.get("rpc_url") or DEFAULT_RPC_URL),
+        simulation_mode=simulation_mode,
         per_package_timeout_seconds=_safe_float(raw.get("per_package_timeout_seconds"), 300.0),
         max_plan_attempts=_safe_int(raw.get("max_plan_attempts"), 2),
         continue_on_error=bool(raw.get("continue_on_error", True)),
@@ -97,7 +116,7 @@ def _extract_payload(context: RequestContext) -> dict[str, Any]:
             v = safe_json_loads(raw, context="user input payload")
             if isinstance(v, dict):
                 return v
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
             pass
 
     params = getattr(context, "_params", None)
@@ -112,7 +131,8 @@ def _extract_payload(context: RequestContext) -> dict[str, Any]:
 def _summarize_phase2_results(out_json: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     try:
         data = safe_json_loads(out_json.read_text(encoding="utf-8"), context="phase2 results")
-    except Exception:
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.error("Failed to load phase2 results JSON: %s", e, exc_info=True)
         return {}, []
 
     # Return as much as we can even if some fields are missing.
@@ -216,7 +236,8 @@ def _summarize_failure_modes(errors: list[dict[str, Any]]) -> dict[str, int]:
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
         data = safe_json_loads(path.read_text(encoding="utf-8"), context=f"reading {path}")
-    except Exception:
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+        logger.warning("Failed to read JSON file %s: %s", path, e, exc_info=True)
         return None
     if not isinstance(data, dict):
         return None
@@ -346,7 +367,8 @@ class SmiBenchGreenExecutor(AgentExecutor):
         assert task is not None
 
         payload = _extract_payload(context)
-        cfg = _load_cfg(payload.get("config") if isinstance(payload, dict) else {})
+        config = payload.get("config") if isinstance(payload.get("config"), dict) else {}
+        cfg = _load_cfg(config)
 
         out_dir = Path(payload.get("out_dir") or "results/a2a")
         repo_root = Path(__file__).resolve().parents[2]
@@ -358,43 +380,44 @@ class SmiBenchGreenExecutor(AgentExecutor):
         log_dir = repo_root / "logs"
         events_path = log_dir / run_id / "events.jsonl"
         run_metadata_path = log_dir / run_id / "run_metadata.json"
+        
+        venv_bin = repo_root / ".venv" / "bin"
 
         args = [
-            "uv",
-            "run",
-            "smi-inhabit",
-            "--corpus-root",
-            cfg.corpus_root,
-            "--package-ids-file",
-            cfg.package_ids_file,
-            "--agent",
-            cfg.agent,
-            "--rpc-url",
-            cfg.rpc_url,
-            "--simulation-mode",
-            cfg.simulation_mode,
-            "--per-package-timeout-seconds",
-            str(cfg.per_package_timeout_seconds),
-            "--max-plan-attempts",
-            str(cfg.max_plan_attempts),
+            str(venv_bin / "smi-inhabit"),
+            "--corpus-root", str(cfg.corpus_root),
+            "--package-ids-file", str(cfg.package_ids_file),
+            "--agent", cfg.agent,
+            "--rpc-url", cfg.rpc_url,
+            "--simulation-mode", cfg.simulation_mode,
+            "--per-package-timeout-seconds", str(cfg.per_package_timeout_seconds),
+            "--max-plan-attempts", str(cfg.max_plan_attempts),
+            "--out", str(out_json),
+            "--run-id", run_id,
+            "--samples", str(cfg.samples),
         ]
-        if "max_planning_calls" in payload.get("config", {}):
-            args.extend(["--max-planning-calls", str(int(payload["config"]["max_planning_calls"]))])
+        
+        # Pass through tunable parameters from config
+        if "max_planning_calls" in config:
+            args.extend(["--max-planning-calls", str(int(config["max_planning_calls"]))])
 
-        args.extend(
-            [
-                "--out",
-                str(out_json),
-                "--run-id",
-                run_id,
-            ]
-        )
-        if cfg.samples and cfg.samples > 0:
-            args.extend(["--samples", str(cfg.samples)])
         if cfg.continue_on_error:
             args.append("--continue-on-error")
         if cfg.resume:
             args.append("--resume")
+        
+        # Add additional tunable parameters
+        sender = config.get("sender")
+        if sender:
+            args.extend(["--sender", str(sender)])
+            
+        gas_budget = config.get("gas_budget")
+        if gas_budget:
+            args.extend(["--gas-budget", str(gas_budget)])
+            
+        checkpoint_every = config.get("checkpoint_every")
+        if checkpoint_every:
+            args.extend(["--checkpoint-every", str(checkpoint_every)])
 
         # Sanitize environment to prevent accidental bleed-through
         # while preserving essential system paths and SMI configuration.
@@ -468,8 +491,8 @@ class SmiBenchGreenExecutor(AgentExecutor):
                             TaskState.working,
                             new_agent_text_message(msg, updater.context_id, updater.task_id),
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to update task status: %s", e)
                 else:
                     # Normal log line - buffer for tail report but don't spam status
                     proc_lines.append(line)
@@ -682,7 +705,7 @@ def build_app(*, public_url: str) -> Any:
     )
     app = A2AStarletteApplication(agent_card=card, http_handler=handler).build()
 
-    # Add health check endpoint
+    # Add health check endpoint with comprehensive status
     @app.route("/health")
     async def health(request: Request) -> JSONResponse:
         from smi_bench.inhabit_runner import _default_dev_inspect_binary
@@ -692,16 +715,58 @@ def build_app(*, public_url: str) -> Any:
         rust_bin = default_rust_binary()
         sim_bin = _default_dev_inspect_binary()
 
+        binaries_ok = rust_bin.exists() and sim_bin.exists()
+
+        # Check RPC connectivity (non-blocking with timeout)
+        rpc_url = DEFAULT_RPC_URL
+        rpc_status = {"url": rpc_url, "reachable": False, "error": None}
+        try:
+            async with httpx.AsyncClient(timeout=HEALTH_CHECK_TIMEOUT_SECONDS) as client:
+                resp = await client.post(
+                    rpc_url,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "sui_getLatestCheckpointSequenceNumber",
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if "result" in data:
+                        rpc_status["reachable"] = True
+                        rpc_status["checkpoint"] = data.get("result")
+                    elif "error" in data:
+                        rpc_status["error"] = str(data.get("error", {}).get("message", "unknown"))
+                else:
+                    rpc_status["error"] = f"HTTP {resp.status_code}"
+        except httpx.TimeoutException:
+            rpc_status["error"] = "timeout"
+        except Exception as e:
+            rpc_status["error"] = f"{type(e).__name__}: {e}"
+
+        # Get executor status if available
+        executor_status = {"active_tasks": 0, "task_ids": []}
+        if _global_executor is not None:
+            active_tasks = list(_global_executor._task_processes.keys())
+            executor_status["active_tasks"] = len(active_tasks)
+            executor_status["task_ids"] = active_tasks[:5]  # Limit to first 5
+
+        # Determine overall health
+        is_healthy = binaries_ok  # RPC is optional for health (might use different RPC per request)
+        overall_status = "ok" if is_healthy else "degraded"
+
         status = {
-            "status": "ok",
+            "status": overall_status,
             "binaries": {
                 "extractor": {"path": str(rust_bin), "exists": rust_bin.exists()},
                 "simulator": {"path": str(sim_bin), "exists": sim_bin.exists()},
             },
+            "rpc": rpc_status,
+            "executor": executor_status,
         }
 
-        # If binaries are missing, the agent is technically 'unhealthy' for its task
-        if not (rust_bin.exists() and sim_bin.exists()):
+        # Return 503 if binaries are missing
+        if not binaries_ok:
             return JSONResponse(status, status_code=503)
 
         return JSONResponse(status)
@@ -712,12 +777,43 @@ def build_app(*, public_url: str) -> Any:
     return app
 
 
+# Global executor reference for signal handling
+_global_executor: SmiBenchGreenExecutor | None = None
+
+
+def _setup_signal_handlers() -> None:
+    """
+    Set up signal handlers for graceful shutdown.
+
+    When SIGTERM/SIGINT is received, terminate all running subprocesses
+    before exiting. This ensures no zombie processes when the container stops.
+    """
+
+    def handler(signum: int, frame: Any) -> None:
+        if _global_executor is not None:
+            for task_id, proc in list(_global_executor._task_processes.items()):
+                if proc.returncode is None:
+                    try:
+                        proc.terminate()
+                    except (OSError, ProcessLookupError) as e:
+                        logger.debug("Failed to terminate process: %s", e)
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, handler)
+
+
 def main(argv: list[str] | None = None) -> None:
+    global _global_executor
+
     p = argparse.ArgumentParser(description="A2A green agent server for smi-bench Phase II")
     p.add_argument("--host", type=str, default="0.0.0.0")
     p.add_argument("--port", type=int, default=9999)
     p.add_argument("--card-url", type=str, default=None)
     args = p.parse_args(argv)
+
+    # Set up signal handlers before starting server
+    _setup_signal_handlers()
 
     url = args.card_url or f"http://{args.host}:{args.port}/"
     app = build_app(public_url=url)

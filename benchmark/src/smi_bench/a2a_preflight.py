@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import socket
 import subprocess
 from pathlib import Path
 
 import httpx
+
+from smi_bench.constants import DEFAULT_RPC_URL
+
+logger = logging.getLogger(__name__)
 
 
 def _check_path_exists(label: str, path: Path) -> None:
@@ -19,7 +24,7 @@ def _check_rpc_reachable(rpc_url: str, *, timeout_s: float) -> None:
             r = client.post(rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": "rpc.discover", "params": []})
             # Some endpoints may not implement discover; any HTTP response is enough.
             _ = r.status_code
-    except Exception as e:
+    except (httpx.HTTPError, httpx.TimeoutException, OSError) as e:
         raise SystemExit(f"rpc_unreachable: {rpc_url} ({type(e).__name__}: {e})")
 
 
@@ -27,7 +32,7 @@ def _is_listening(host: str, port: int) -> bool:
     try:
         with socket.create_connection((host, port), timeout=0.5):
             return True
-    except Exception:
+    except (OSError, socket.timeout):
         return False
 
 
@@ -51,7 +56,7 @@ def main(argv: list[str] | None = None) -> None:
         default=Path("../target/release/smi_tx_sim"),
         help="Path to smi_tx_sim (relative to benchmark/)",
     )
-    p.add_argument("--rpc-url", type=str, default="https://fullnode.mainnet.sui.io:443")
+    p.add_argument("--rpc-url", type=str, default=DEFAULT_RPC_URL)
     p.add_argument(
         "--green-url",
         type=str,
@@ -113,7 +118,7 @@ def main(argv: list[str] | None = None) -> None:
         cmd.extend(["--scenario", args.scenario])
     subprocess.run(cmd, check=True)
 
-    print("ready_for_full_run")
+    logger.info("ready_for_full_run")
 
 
 if __name__ == "__main__":

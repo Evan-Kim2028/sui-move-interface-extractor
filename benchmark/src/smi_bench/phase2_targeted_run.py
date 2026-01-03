@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import subprocess
 import time
 from pathlib import Path
+
+from smi_bench.constants import DEFAULT_RPC_URL
+
+logger = logging.getLogger(__name__)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -26,7 +31,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--min-hits", type=int, default=1, help="Keep packages with created_hits >= N")
     p.add_argument("--scan-samples", type=int, default=500)
     p.add_argument("--run-samples", type=int, default=50)
-    p.add_argument("--rpc-url", type=str, default="https://fullnode.mainnet.sui.io:443")
+    p.add_argument("--rpc-url", type=str, default=DEFAULT_RPC_URL)
     p.add_argument("--per-package-timeout-seconds", type=float, default=90)
     p.add_argument("--max-plan-attempts", type=int, default=2)
     p.add_argument(
@@ -130,10 +135,10 @@ def main(argv: list[str] | None = None) -> None:
         check=True,
     )
 
-    print(f"scan_out={scan_out}")
-    print(f"manifest_out={manifest_out}")
-    print(f"signal_out={args.signal_out}")
-    print(f"run_out={run_out}")
+    logger.info(f"scan_out={scan_out}")
+    logger.info(f"manifest_out={manifest_out}")
+    logger.info(f"signal_out={args.signal_out}")
+    logger.info(f"run_out={run_out}")
 
 
 if __name__ == "__main__":

@@ -7,6 +7,10 @@ RESULTS_HOST="$REPO_ROOT/benchmark/.docker_test_results"
 LOGS_HOST="$REPO_ROOT/benchmark/.docker_test_logs"
 MANIFEST_HOST="$CORPUS_HOST/manifest.txt"
 
+# Default configuration
+DEFAULT_SENDER="0x064d87c3da8b7201b18c05bfc3189eb817920b2d089b33e207d1d99dc5ce08e0"
+DEFAULT_MODEL="google/gemini-3-flash-preview"
+
 # Ensure corpus exists
 if [ ! -d "$CORPUS_HOST" ]; then
     echo "Corpus not found. Attempting to run prepare_test_corpus.sh..."
@@ -23,7 +27,27 @@ fi
 
 # Create manifest file
 # The package ID must match what's in metadata.json
-echo "0x0000000000000000000000000000000000000000000000000000000000000001" > "$MANIFEST_HOST"
+# Use the quickstart_2 dataset if available, otherwise fallback to mock
+if [ -f "$REPO_ROOT/benchmark/manifests/datasets/quickstart_2.txt" ]; then
+    echo "Using Quickstart dataset (2 packages)..."
+    cp "$REPO_ROOT/benchmark/manifests/datasets/quickstart_2.txt" "$MANIFEST_HOST"
+    # Ensure we mount the real corpus if we are using real packages
+    # This logic assumes the user has the 'sui-packages' repo adjacent or we need to fetch them
+    # For now, if we are in the test script, we might not have the full corpus. 
+    # Let's check if we can symlink the mainnet_most_used if it exists
+    REAL_CORPUS_PARENT="$REPO_ROOT/../sui-packages/packages"
+    CONTAINER_CORPUS_PATH="/app/corpus"
+    
+    if [ -d "$REAL_CORPUS_PARENT/mainnet_most_used" ]; then
+       CORPUS_HOST="$REAL_CORPUS_PARENT"
+       # We mount the PARENT 'packages' dir to /app/corpus to support symlinks
+       # So the actual root for the runner is /app/corpus/mainnet_most_used
+       CONTAINER_CORPUS_PATH="/app/corpus/mainnet_most_used"
+    fi
+else
+    echo "0x0000000000000000000000000000000000000000000000000000000000000001" > "$MANIFEST_HOST"
+    CONTAINER_CORPUS_PATH="/app/corpus"
+fi
 
 echo "Cleaning up old results and logs..."
 rm -rf "$RESULTS_HOST"/*
@@ -36,7 +60,8 @@ docker build -t smi-bench:test .
 
 # Allow overriding model and agent via env
 AGENT="${SMI_AGENT:-real-openai-compatible}"
-MODEL="${SMI_MODEL:-google/gemini-2.0-pro-exp-02-05:free}"
+MODEL="${SMI_MODEL:-$DEFAULT_MODEL}"
+SENDER="${SMI_SENDER:-$DEFAULT_SENDER}"
 
 echo "Starting container..."
 # Mount corpus to /app/corpus
@@ -48,10 +73,22 @@ if [ -f "$REPO_ROOT/benchmark/.env" ]; then
     ENV_ARGS="--env-file $REPO_ROOT/benchmark/.env"
 fi
 
+# Determine volumes
+# If we are using the real corpus, we mount it. Otherwise we use the test corpus.
+# We also explicitly mount the manifest file to /app/manifest.txt
+MOUNT_ARGS="-v $CORPUS_HOST:/app/corpus -v $MANIFEST_HOST:/app/manifest.txt"
+
+# Ensure port 9999 is free
+existing=$(docker ps -q --filter "publish=9999")
+if [ ! -z "$existing" ]; then
+    echo "Freeing port 9999..."
+    docker stop $existing > /dev/null
+fi
+
 CONTAINER_ID=$(docker run -d --rm \
     $ENV_ARGS \
     -e SMI_MODEL="$MODEL" \
-    -v "$CORPUS_HOST:/app/corpus" \
+    $MOUNT_ARGS \
     -v "$RESULTS_HOST:/app/results" \
     -v "$LOGS_HOST:/app/logs" \
     -p 9999:9999 \
@@ -78,6 +115,7 @@ done
 # Prepare task payload
 # We use the 'message/send' method which is standard for A2A agents in this project.
 # The config is passed as a JSON string inside the message text part.
+# We pass the SENDER to ensure the runner has funds.
 PAYLOAD=$(cat <<EOF
 {
   "jsonrpc": "2.0",
@@ -89,7 +127,7 @@ PAYLOAD=$(cat <<EOF
       "role": "user",
       "parts": [
         {
-          "text": "{\\"config\\": {\\"corpus_root\\": \\"/app/corpus\\", \\"package_ids_file\\": \\"/app/corpus/manifest.txt\\", \\"agent\\": \\"$AGENT\\", \\"samples\\": 1, \\"simulation_mode\\": \\"dry-run\\", \\"run_id\\": \\"docker_smoke_test\\", \\"continue_on_error\\": true, \\"resume\\": false}, \\"out_dir\\": \\"/app/results\\"}"
+          "text": "{\\"config\\": {\\"corpus_root\\": \\"$CONTAINER_CORPUS_PATH\\", \\"package_ids_file\\": \\"/app/manifest.txt\\", \\"agent\\": \\"$AGENT\\", \\"samples\\": 2, \\"simulation_mode\\": \\"dry-run\\", \\"run_id\\": \\"quickstart_test\\", \\"continue_on_error\\": true, \\"resume\\": false, \\"sender\\": \\"$SENDER\\", \\"checkpoint_every\\": 1}, \\"out_dir\\": \\"/app/results\\"}"
         }
       ]
     }
@@ -98,25 +136,27 @@ PAYLOAD=$(cat <<EOF
 EOF
 )
 
-echo "Submitting task (Agent: $AGENT, Model: $MODEL)..."
+echo "Submitting task (Agent: $AGENT, Model: $MODEL, Sender: $SENDER)..."
 curl -X POST http://localhost:9999/ \
     -H "Content-Type: application/json" \
     -d "$PAYLOAD"
 
 echo ""
-echo "Task submitted. Waiting for results (up to 120s)..."
+echo "Task submitted. Waiting for results (up to 20s)..."
 
 # Poll for result file
-for i in {1..120}; do
-    if [ -f "$RESULTS_HOST/docker_smoke_test.json" ]; then
+for i in {1..20}; do
+    if [ -f "$RESULTS_HOST/quickstart_test.json" ]; then
+        # Check if we have results for both packages or if it finished
+        # We can just cat the summary
         echo "SUCCESS: Result file generated."
-        cat "$RESULTS_HOST/docker_smoke_test.json" | head -n 50
+        cat "$RESULTS_HOST/quickstart_test.json" | head -n 50
         exit 0
     fi
     sleep 1
 done
 
-echo "FAILURE: Result file not found after 120s."
+echo "FAILURE: Result file not found after 20s."
 docker logs "$CONTAINER_ID"
 exit 1
 

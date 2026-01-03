@@ -60,7 +60,7 @@ class PurpleExecutor(AgentExecutor):
         payload: Any
         try:
             payload = json.loads(raw) if raw else raw
-        except Exception:
+        except json.JSONDecodeError:
             payload = raw
 
         reply = {"ok": True, "echo": payload}

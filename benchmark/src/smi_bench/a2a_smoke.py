@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
 
 import httpx
+
+from smi_bench.constants import DEFAULT_RPC_URL
+
+logger = logging.getLogger(__name__)
 
 
 def _port_is_listening(port: int) -> bool:
@@ -140,7 +145,7 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="If ports are already in use, attempt to kill listeners on 9999/9998 before starting scenario.",
     )
-    p.add_argument("--rpc-url", type=str, default="https://fullnode.mainnet.sui.io:443")
+    p.add_argument("--rpc-url", type=str, default=DEFAULT_RPC_URL)
     p.add_argument("--simulation-mode", type=str, default="dry-run")
     p.add_argument(
         "--sender",
@@ -280,13 +285,29 @@ def main(argv: list[str] | None = None) -> None:
         errors = bundle.get("errors")
         artifacts = bundle.get("artifacts")
 
-        print(f"run_id={bundle.get('run_id')} exit_code={bundle.get('exit_code')}")
-        print(f"metrics={json.dumps(metrics, sort_keys=True)}")
-        print(f"errors_len={len(errors) if isinstance(errors, list) else 'unknown'}")
+        logger.info(
+            "run_id=%s exit_code=%s",
+            bundle.get("run_id"),
+            bundle.get("exit_code"),
+        )
+        logger.info(
+            "metrics=%s",
+            json.dumps(metrics, sort_keys=True),
+        )
+        logger.info(
+            "errors_len=%s",
+            len(errors) if isinstance(errors, list) else "unknown",
+        )
         if isinstance(artifacts, dict):
-            print(f"results_path={artifacts.get('results_path')}")
-            print(f"events_path={artifacts.get('events_path')}")
-        print(f"response_path={args.out_response}")
+            logger.info(
+                "results_path=%s events_path=%s",
+                artifacts.get("results_path"),
+                artifacts.get("events_path"),
+            )
+        logger.info(
+            "response_path=%s",
+            args.out_response,
+        )
     finally:
         if started_pid is not None:
             try:
@@ -294,8 +315,8 @@ def main(argv: list[str] | None = None) -> None:
                 import signal
 
                 os.kill(started_pid, signal.SIGTERM)
-            except Exception:
-                pass
+            except (OSError, ProcessLookupError) as e:
+                logger.debug("Failed to terminate scenario process %d: %s", started_pid, e)
 
 
 if __name__ == "__main__":

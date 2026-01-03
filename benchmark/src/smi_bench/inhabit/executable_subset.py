@@ -295,7 +295,11 @@ def summarize_interface(
                 wanted = requested_by_mod.get(module_name)
                 if not wanted or fun_name not in wanted:
                     continue
+                # In focused mode, we SHOW everything requested, even if it is private/init,
+                # so the model can see why it cannot call it.
             else:
+                if fun_name == "init":
+                    continue
                 if mode == "entry_only" and not is_entry:
                     continue
                 if not is_public and not is_entry:
@@ -321,6 +325,10 @@ def summarize_interface(
         if module_lines:
             lines.append(f"Module: {module_name}")
             lines.extend(module_lines)
+            lines.append("")
+        elif mode == "focused":
+            lines.append(f"Module: {module_name}")
+            lines.append("  (No public/entry functions found in this module)")
             lines.append("")
 
     if total_funs_added >= max_functions:

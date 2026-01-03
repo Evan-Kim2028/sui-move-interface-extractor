@@ -43,11 +43,16 @@ Both Phase I and Phase II consume a local `sui-packages` checkout (bytecode corp
   - Scores created object types vs targets using base-type matching (`smi_bench/inhabit/score.py`).
 
 - `smi_bench/inhabit/executable_subset.py`
-  - The core deterministic “baseline-search” logic:
+  - The core deterministic "baseline-search" logic:
     - candidate selection for entry functions,
     - supported-arg construction rules,
     - shallow recursive constructor discovery,
     - prompt-oriented interface summaries (`summarize_interface`).
+    - **Interface Summary Modes**: `summarize_interface()` supports four modes:
+      - `entry_then_public` (default): Entry functions first, then public functions.
+      - `entry_only`: Only entry functions (used by `real-openai-compatible`).
+      - `names_only`: Only module + function names (no signatures).
+      - `focused`: Include only specified functions (for progressive expansion).
 
 - `smi_bench/inhabit/normalize.py`
   - Auto-corrects common LLM formatting mistakes in PTB plans before simulation.
@@ -132,6 +137,31 @@ It provides: streaming execution, artifact encapsulation, and scenario lifecycle
   - Manages scenario lifecycle (--status, --kill)
   - Handles .env propagation to subprocesses
 
+### Progressive Exposure (Design)
+
+The `real-openai-compatible` agent supports a progressive exposure pattern to balance context window constraints with comprehensive interface information.
+
+**Current Implementation Status:**
+- ✅ `summarize_interface()` supports 4 modes (`entry_then_public`, `entry_only`, `names_only`, `focused`)
+- ✅ Prompt includes `need_more` instruction format
+- ✅ `need_more` response handling is **fully implemented** in `inhabit_runner.py`
+- ✅ `--max-planning-calls` parameter exists (default: 50, recommended: 2-3)
+
+**Workflow:**
+1. Model receives initial interface summary (`mode="entry_then_public"`, `max_functions=60`)
+2. If model needs more detail, returns: `{"need_more": ["0xADDR::module::function", ...], "reason": "..."}`
+3. Runner re-invokes model with focused summary (`mode="focused"`, `requested_targets` from `need_more`)
+4. Model returns final PTB plan
+
+**Loop Detection:** The runner includes a safeguard to detect and break infinite `need_more` loops if a model requests the same targets multiple times.
+
+**Tuning Parameters:**
+- `--max-planning-calls`: Maximum LLM planning calls per package (higher = more progressive exposure rounds)
+- `max_functions` in `summarize_interface()`: Controls initial interface chunk size
+- Interface summary mode choice affects what model sees upfront
+
+**See also:** [A2A_TUNING.md](A2A_TUNING.md) for practical tuning guidance
+
 ### A2A Protocol Flow
 
 ```
@@ -203,7 +233,7 @@ Invariants:
 - `scenario_smi/scenario.toml`: Scenario configuration (ports, commands)
 - `.env`: API keys for agent subprocesses (SMI_API_KEY, OPENROUTER_API_KEY)
 
-See `benchmark/GETTING_STARTED.md` for usage examples and `benchmark/docs/A2A_EXAMPLES.md` for protocol details.
+See `benchmark/GETTING_STARTED.md` for usage examples and `benchmark/docs/A2A_EXAMPLES.md` for protocol details. See `benchmark/docs/A2A_TUNING.md` for practical tuning guidance.
 
 ## Output schemas / versioning invariants
 

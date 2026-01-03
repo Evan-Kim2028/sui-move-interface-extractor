@@ -22,13 +22,13 @@ def _parse_abort_code(error: str) -> int | None:
     if m:
         try:
             return int(m.group(2))
-        except Exception:
+        except (ValueError, TypeError, IndexError):
             return None
     m = _ABORT_CODE_RE2.search(error)
     if m:
         try:
             return int(m.group(1))
-        except Exception:
+        except (ValueError, TypeError, IndexError):
             return None
     return None
 
