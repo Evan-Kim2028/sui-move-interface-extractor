@@ -7,6 +7,13 @@ from typing import Iterable
 
 from smi_bench.utils import safe_json_loads
 
+# Addresses to filter out from analysis
+BLACKLISTED_ADDRESSES = {
+    "FBNeU62dhM5gZsBgq2gUKRxYRo2QpriciUeNjLLT5VUj",
+    "7RpDrVZdZjUFkKuRyAmLoqDpLcPHmGyi6zCGfhCeWgCn",
+    "G5uEKjtXUWMDxCyzBq6RMGrDWVxxDadVza79N4qa45hE",
+}
+
 
 @dataclass(frozen=True)
 class PackageRef:
@@ -64,7 +71,7 @@ def collect_packages(corpus_root: Path) -> list[PackageRef]:
         package_id = read_package_id_from_metadata(resolved)
         if not package_id:
             continue
-        if package_id in seen:
+        if package_id in seen or package_id in BLACKLISTED_ADDRESSES:
             continue
         seen.add(package_id)
         out.append(PackageRef(package_id=package_id, package_dir=str(resolved)))

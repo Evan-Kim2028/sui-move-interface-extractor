@@ -8,6 +8,7 @@ dependencies = [
     "agentbeats>=1.2.6",
     "httpx>=0.27.0",
     "rich>=14.2.0",
+    "markdown>=3.6",
 ]
 
 [project.optional-dependencies]
@@ -76,6 +77,9 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 addopts = "-n auto"
+markers = [
+    "integration: marks tests as integration tests (slow, requires docker)"
+]
 filterwarnings = [
     "ignore:The `on_event` decorator is deprecated:DeprecationWarning:starlette.*",
     "ignore:The `route` decorator is deprecated:DeprecationWarning:starlette.*",

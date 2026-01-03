@@ -626,7 +626,6 @@ def type_to_default_ptb_arg(t: dict) -> dict | None:
     return None
 
 
-
 def analyze_package(interface_json: dict) -> PackageAnalysis:
     pkg_id = interface_json.get("package_id")
     if not isinstance(pkg_id, str) or not pkg_id:

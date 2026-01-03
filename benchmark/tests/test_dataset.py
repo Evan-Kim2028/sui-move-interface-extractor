@@ -37,3 +37,24 @@ def test_sample_packages_is_deterministic(tmp_path: Path) -> None:
     s1 = sample_packages(pkgs, 2, 123)
     s2 = sample_packages(pkgs, 2, 123)
     assert [p.package_id for p in s1] == [p.package_id for p in s2]
+
+
+def test_collect_packages_filters_blacklisted_addresses(tmp_path: Path) -> None:
+    corpus = tmp_path / "mainnet_most_used"
+    (corpus / "0x00").mkdir(parents=True)
+
+    # 1. Normal address
+    pkg1 = corpus / "0x00" / "pkg1"
+    pkg1.mkdir(parents=True)
+    (pkg1 / "bytecode_modules").mkdir()
+    _write_metadata(pkg1, "0x123")
+
+    # 2. Blacklisted address
+    pkg2 = corpus / "0x00" / "pkg2"
+    pkg2.mkdir(parents=True)
+    (pkg2 / "bytecode_modules").mkdir()
+    _write_metadata(pkg2, "FBNeU62dhM5gZsBgq2gUKRxYRo2QpriciUeNjLLT5VUj")
+
+    pkgs = collect_packages(corpus)
+    assert len(pkgs) == 1
+    assert pkgs[0].package_id == "0x123"

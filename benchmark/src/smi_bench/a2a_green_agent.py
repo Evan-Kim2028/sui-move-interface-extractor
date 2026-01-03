@@ -10,7 +10,6 @@ import os
 import signal
 import sys
 import time
-from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -413,12 +412,18 @@ class SmiBenchGreenExecutor(AgentExecutor):
         task = context.current_task
         assert task is not None
 
+        repo_root = Path(__file__).resolve().parents[2]
         payload = _extract_payload(context)
         config = payload.get("config") if isinstance(payload.get("config"), dict) else {}
         cfg = _load_cfg(config)
 
+        # Default manifest path
+        default_manifest = repo_root / "manifests/datasets/type_inhabitation_top25.txt"
+        package_ids_file = Path(cfg.package_ids_file) if cfg.package_ids_file else default_manifest
+        if not package_ids_file.is_absolute():
+            package_ids_file = repo_root / package_ids_file
+
         out_dir = Path(payload.get("out_dir") or "results/a2a")
-        repo_root = Path(__file__).resolve().parents[2]
         out_dir = (repo_root / out_dir) if not out_dir.is_absolute() else out_dir
         out_dir.mkdir(parents=True, exist_ok=True)
         run_id = cfg.run_id or f"a2a_phase2_{int(time.time())}"
@@ -435,7 +440,7 @@ class SmiBenchGreenExecutor(AgentExecutor):
             "--corpus-root",
             str(cfg.corpus_root),
             "--package-ids-file",
-            str(cfg.package_ids_file),
+            str(package_ids_file),
             "--agent",
             cfg.agent,
             "--rpc-url",

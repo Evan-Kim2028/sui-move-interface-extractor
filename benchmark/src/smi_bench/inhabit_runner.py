@@ -348,10 +348,12 @@ def _build_real_agent_prompt(
         "Return ONLY valid JSON matching this schema:\n"
         '{"calls":[{"target":"0xADDR::module::function","type_args":["<TypeTag>",...],'
         '"args":[{"u64":1},{"vector_u8_utf8":"hi"},{"imm_or_owned_object":"0xID"},...] }]}\n'
-        "- Use 'imm_or_owned_object' for objects you own.\n"
+        "- Use 'imm_or_owned_object' for owned objects.\n"
         '- Use \'shared_object\' for shared objects: {"shared_object": {"id": "0x...", "mutable": true}}\n'
-        "- NEVER use arg kinds named 'object' or 'object_id' (unsupported).\n"
-        "  If you have an object id, use 'imm_or_owned_object' instead.\n"
+        "- Use 'pure' for BCS-encoded bytes (hex string).\n"
+        "- Supported primitive kinds: 'u8', 'u16', 'u32', 'u64', 'u128', 'u256', "
+        "'bool', 'address', 'vector_u8_utf8', 'vector_u8_hex'.\n"
+        "- NEVER use arg kinds: 'input', 'string', 'object', 'object_id', 'hex', 'pure_u64' (unsupported).\n"
         "- Do not include tx_context arguments (implicit).\n"
         "### Progressive Exposure (IMPORTANT)\n"
         "You may request more interface details if needed by returning ONLY this JSON object:\n"
