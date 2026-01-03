@@ -44,3 +44,18 @@ In Phase II, a score of `0` is often more insightful than a `1`:
 - **Execution Fail / Hits 0**: The model failed to understand Move preconditions (e.g., calling a function with the wrong arguments). This indicates a failure in **program logic**.
 
 By analyzing these failure modes, you can determine if an agent needs better **tooling** (more context) or a better **foundation model** (stronger reasoning).
+
+---
+
+## 5. Common Architectural Failures
+
+Observation of model performance across thousands of runs has revealed several recurring failure patterns:
+
+### A. Result Reference Mismanagement
+Models frequently attempt to use `{"input": 0}` or `{"arg": 0}` to refer to the output of a previous call. Our schema explicitly requires `{"result": index}`. High-performing models correctly grasp this "data-flow" dependency, whereas smaller models often hallucinate alternative keys.
+
+### B. Arg Kind Confusion
+A significant source of invalid PTBs is the use of `hex` or `object_id` as keys. While intuitive, these are not supported by the core simulator. The **Normalization** layer catches many of these, but models that produce the correct `imm_or_owned_object` kind upfront show a stronger alignment with the Move ecosystem's technical requirements.
+
+### C. Recursive Depth Blindness
+In many complex Sui packages, creating a target object requires a 2-step or 3-step sequence (e.g., `create_cap()` -> `mint_obj(cap)`). Models that fail to request additional module details via `need_more` often guess at 1-step execution paths, leading to `MoveAbort` errors. Successful agents demonstrate the ability to "unroll" these dependencies through progressive exploration.

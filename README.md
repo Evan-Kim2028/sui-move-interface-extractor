@@ -58,6 +58,7 @@ cd benchmark
 ### 📖 Research & Methodology
 - **[Insights & Reward](docs/INSIGHTS.md)** - High-value takeaways and research value proposition.
 - **[Methodology](docs/METHODOLOGY.md)** - Scoring rules, bytecode-first logic, and AgentBeats mapping.
+- **[PTB Schema](docs/PTB_SCHEMA.md)** - Transaction plan format and normalization rules.
 - **[Architecture](docs/ARCHITECTURE.md)** - Maintainers' map of the system internals.
 - **[Contributing](docs/CONTRIBUTING.md)** - Developer standards and documentation guidelines.
 

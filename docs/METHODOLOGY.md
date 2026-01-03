@@ -29,41 +29,68 @@ We validate the extracted representation with multiple feedback loops:
 
 The goal of the Phase II inhabitation benchmark is to measure an agent's ability to **construct valid transactions** that result in the creation of specific Move `key` structs (objects) defined in a package.
 
-### Planning Intelligence Focus
-The benchmark is designed to measure **planning and inhabitation intelligence**, not JSON formatting ability:
-- **Automatic Normalization**: Common LLM formatting mistakes (e.g., stringified integers, missing `0x` prefixes) are automatically corrected before simulation.
-- **Planning-Only Metrics**: We compute `planning_only_hit_rate` which excludes packages that failed due to pure formatting errors.
-- **Causality Validation**: We score PTB causality (whether result references point to earlier calls) independent of execution success.
+### Planning Intelligence Focus (Normalization)
+The benchmark is designed to measure **planning and inhabitation intelligence**, not JSON formatting ability. We apply a series of automatic normalization rules to agent outputs:
+- **Alias Resolution**: Automatically maps legacy or common incorrect keys like `"object"` or `"object_id"` to the supported `"imm_or_owned_object"`.
+- **Type Coercion**: Converts stringified numbers/booleans to native JSON types to handle "sloppy" LLM formatting.
+- **Address Padding**: Ensures all Move addresses have the `0x` prefix and are padded to the correct 32-byte hex length.
 
-### Scoring Definition
-- **Targets (truth)**: All structs in the package whose abilities include `key`, derived from the bytecode interface.
-- **Created types (evidence)**: Captured from transaction simulation results (dry-run).
-- **Primary metric (base-type hit rate)**: We score by matching **base types**, ignoring type arguments (e.g., `Coin<SUI>` matches `Coin<FOO>`).
+See **[PTB Schema](PTB_SCHEMA.md)** for the full technical specification of valid kinds and corrections.
 
-### Execution vs Task Completion
-
-We track two orthogonal dimensions:
-
-**Execution correctness** (`dry_run_ok`): Did the PTB execute without Move aborts?
-- Validates runtime behavior (preconditions, business logic, gas)
-- `true` = all Move code completed successfully
-
-**Task success** (`created_hits`): Did we create the target types?
-- Validates planning correctness (function selection, argument filling)
-- `hits = targets` → agent accomplished goal
-
-Common divergence patterns:
-1. **Wrong function**: Agent calls safe no-op instead of constructor
-2. **Wrong args**: Arguments lead to early return without creating objects
-3. **Inventory missing**: Required caps/objects not available (harmless execution)
-
-These are intentional: benchmark measures planning intelligence, not just syntax validity.
+### Scoring Semantics: Base-Type Matching
+A "Hit" is recorded if the transaction simulation results in the creation of an object whose **Base Type** matches a target type.
+- **Generic Handling**: We ignore type arguments during matching. For example, if the target is `0x2::coin::Coin<T>`, creating a `0x2::coin::Coin<0x2::sui::SUI>` counts as a success.
+- **Normalization**: Both target and created types are canonicalized (address padding, case sensitivity) before comparison.
 
 ### The Mechanical Baseline (`baseline-search`)
 We use a deterministic, non-LLM baseline establishing the benchmark's "floor":
 1. **Candidate Selection**: Identifies all `public entry` functions.
-2. **Recursive Constructor Discovery**: Scans for constructors (functions returning the target type) up to 3 levels deep.
+2. **Recursive Constructor Discovery**:
+   - The harness scans for "Constructor" functions (functions that return the target type).
+   - **Search Depth**: The discovery is limited to **3 levels** of recursion to prevent state space explosion.
 3. **PTB Chaining**: Uses Sui Programmable Transaction Blocks to chain constructors and target functions.
+
+### Simulation Strategy & Mock Inventory
+We support three simulation modes, which affect the "evidence" used for scoring:
+- **`dry-run` (Strict)**: Requires a real funded account. Uses authoritative transaction effects from the Sui network.
+- **`dev-inspect` (Lax)**: Executes the transaction without full signature/ownership checks.
+- **`build-only` (Static)**:
+  - For packages that cannot be simulated on-chain, we use a **Mock Inventory Strategy**.
+  - Object IDs like `0x0`, `0x1`, etc., are provided as "filler" arguments.
+  - Scoring is derived from static bytecode analysis of the called functions (checking for `transfer::transfer<T>` calls).
+
+### 2.4 Research Invariants & Technical Decisions
+
+Several "hidden" heuristics define the difficulty and fairness of the benchmark. These are codified in the harness to ensure reproducible results.
+
+#### A. Recursive Search Depth (Limit: 3)
+When discovering constructors for "Baseline Search," the harness performs a recursive scan of the package's public functions.
+- **The Decision**: Recursion is capped at **3 levels**.
+- **Rationale**: Most Sui Move patterns (e.g., Request/Policy patterns) are resolved within 2-3 steps. Deeper recursion often leads to "Solver-style" state explosion which exceeds the scope of a baseline benchmark. This cap defines the "Mechanical Floor" of the benchmark.
+
+#### B. Base-Type Matching (Generics "Close Enough")
+To score a "Hit," the harness compares the type of an object created during simulation against the target types.
+- **The Rule**: Matching is performed on **Base Types** only.
+- **Logic**: Any content between `<` and `>` is stripped before comparison.
+- **Example**: If the target is `0x2::coin::Coin<T>`, then `0x2::coin::Coin<0x2::sui::SUI>` and `0x2::coin::Coin<0x...::usdc::USDC>` are both considered valid hits. This ensures the benchmark measures the ability to find the correct *container* logic even if specific coin types are unavailable.
+
+#### C. Mock Inventory Strategy (Build-Only Mode)
+In `build-only` mode (where no real Sui RPC is available), the harness simulates object ownership:
+- **System Objects**: Standard objects like `0x6` (Clock), `0x8` (Random), and `0x403` (DenyList) are automatically provided.
+- **Deterministic Mock IDs**: Required object arguments are filled with incremental IDs (e.g., `0x0...01`, `0x0...02`).
+- **Gas Simulation**: A dummy gas coin is always injected at a fixed ID (`0x1234`) to satisfy the transaction builder.
+
+#### D. Normalization Rules (The "Fairness" Layer)
+The harness applies strict "massaging" to LLM outputs via `normalize.py`:
+- **Alias Fixes**: `object` and `object_id` → `imm_or_owned_object`.
+- **Address Formatting**: Automatic `0x` prefixing and 32-byte hex padding.
+- **Type Coercion**: Converting `"100"` (string) to `100` (int) for integer-kind arguments.
+This ensures models are scored on their **Move comprehension** rather than their ability to adhere to strict JSON types.
+
+#### E. Loop Detection & Force Planning
+When using **Progressive Exposure** (via `need_more` requests), the harness monitors for repetitive model behavior.
+- **The Valve**: If a model requests the exact same set of functions in two consecutive calls, the harness identifies an infinite loop.
+- **The Correction**: The harness terminates the discovery loop and re-invokes the model with a "Force Plan" instruction, requiring it to provide a best-effort PTB plan using the currently available context. This ensures every package attempt reaches a terminal state and protects the researcher's API budget.
 
 ---
 
