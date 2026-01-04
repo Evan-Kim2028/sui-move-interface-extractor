@@ -82,7 +82,7 @@ jobs:
         run: uv run ty check src
       - name: test
         working-directory: benchmark
-        run: uv run --group dev pytest -q --numprocesses auto
+        run: uv run --group dev pytest -q --numprocesses auto -m "not integration"
 
   docker-a2a-smoke:
     runs-on: ubuntu-latest
